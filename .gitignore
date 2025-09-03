@@ -4,3 +4,4 @@ slurm*.out
 *.ipynb
 .ipynb_checkpoints/
 __pycache__/
+*.pptx
