@@ -37,6 +37,7 @@ mol.incore_anyway = True
 mol.energy_nuc = lambda *args: 0.0
 mol.verbose = 3
 mf = scf.RHF(mol)
+mf.diis = None
 mf.get_hcore = lambda *args: h1
 mf.get_ovlp = lambda *args: np.eye(numKpts)
 mf._eri = ao2mo.restore(8, np.double(eri), numKpts)
