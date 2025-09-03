@@ -156,17 +156,16 @@ class LogSimpleSlater(Wavefunction):
         slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
         return jnp.linalg.slogdet(slaterMatrix)[1]
 
-def coulombYukawa(r, A, F, L, alpha):
+def coulombYukawa(r, A, F, L):
     """
     Coulomb-Yukawa two-body Jastrow function. Also has a decay term so that the
     Jastrow appropriately dies off before the boundary.
 
-    Larger values of `alpha` correspond to faster decays.
     """
     cy = (A/r) * (1 - jnp.exp(-r/F))
     r_cut = L/2
     x = jnp.clip(r / r_cut, a_min=0.0, a_max=1.0-1e-5)
-    decay = jnp.exp(alpha * (1 - 1 / (1 - x**2)))
+    decay = jnp.exp(1 - 1 / (1 - x**2))
     return cy * decay
 
 def getOffDiagonalFlat(x):
@@ -196,7 +195,6 @@ class LogCYJastrow(Wavefunction):
     """
     spins : (int,int)
     L : float
-    alpha: float = 1
 
     def setup(self):
 
@@ -225,10 +223,10 @@ class LogCYJastrow(Wavefunction):
         same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
         same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
         sameDists = jnp.concatenate([same_up, same_down])
-        sameCY = coulombYukawa(sameDists, A_same, F_same, self.L, self.alpha)
+        sameCY = coulombYukawa(sameDists, A_same, F_same, self.L)
         
         diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
-        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L, self.alpha)
+        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
 
         return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
 
@@ -241,12 +239,11 @@ class LogSlaterCYJastrow(Wavefunction):
     """
     spins : (int,int)
     L : float
-    alpha: float = 1
 
     def setup(self):
         self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L, self.alpha)
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
 
     def __call__(self, rs):
         slaterUp = self.slaterUp(rs[:self.spins[0],:])
