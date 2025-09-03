@@ -9,6 +9,19 @@ class LocalEnergy:
         batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
         return batchFunction(parameters, walkerRs)
 
+def laplacian(logWavefunction, parameters, rs):
+    def f_rs(rs):
+        return logWavefunction(parameters, rs)
+
+    grad_fn = jax.grad(f_rs)
+
+    rs_flat = rs.reshape(-1)
+    def unit_lapl(i):
+        e_i = jnp.eye(rs_flat.size)[i]   # ith unit vector
+        return jax.jvp(grad_fn, (rs,), (e_i.reshape(rs.shape),))[1].reshape(-1)[i]
+
+    return jnp.sum(jax.vmap(unit_lapl)(jnp.arange(rs_flat.size)))
+
 class LocalKineticEnergy(LocalEnergy):
     """
     Computes the local kinetic energy of an arbitrary log wavefunction.
@@ -19,10 +32,8 @@ class LocalKineticEnergy(LocalEnergy):
 
     def configuration(self, parameters, rs):
 
-        hessFunction = jax.hessian(self.logWavefunction, argnums=1)
-        hess = hessFunction(parameters, rs)  # shape (N, 3, N, 3)
-        grad2f = jnp.trace(hess, axis1=0, axis2=2).trace()
-        
+        grad2f = laplacian(self.logWavefunction, parameters, rs)
+
         gradFunction = jax.grad(self.logWavefunction, argnums=1)
         grad = gradFunction(parameters, rs)  # shape (N, 3)
         gradf2 = jnp.sum(grad ** 2)
