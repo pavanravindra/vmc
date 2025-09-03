@@ -17,8 +17,8 @@ class MetropolisUpdater:
                 
         shiftRng, acceptRng = jax.random.split(rng, 2)
         
-        positionShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
-        rs2 = rs1 + positionShift
+        randomShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
+        rs2 = rs1 + randomShift
         
         probRatio = jnp.exp(
             2 * (self.logWavefunction(parameters,rs2) - self.logWavefunction(parameters,rs1))
@@ -35,8 +35,9 @@ class MetropolisUpdater:
 
 class MALAUpdater:
 
-    def __init__(self, logWavefunction, clipGradients=True):
+    def __init__(self, logWavefunction, r_ws, clipGradients=True):
         self.logWavefunction = logWavefunction.apply
+        self.r_ws = r_ws
         self.gradLogWavefunction = jax.grad(logWavefunction.apply, argnums=1)
         self.clipGradients = clipGradients
         self.updateWalkers = jax.vmap(
@@ -47,27 +48,29 @@ class MALAUpdater:
     def updateConfiguration(self, parameters, rs1, rng, tau):
 
         def clip(jnpArray):
-            # Clips elements of `jnpArray` to have absolute value <= 1
-            maxValue = 3e-1
+            # Clips elements of `jnpArray` to have absolute value <= r_ws / 10
+            maxValue = self.r_ws / 10
             mask = jnp.abs(jnpArray) > maxValue
             return jnp.where(mask, maxValue * jnp.sign(jnpArray), jnpArray)
     
         def proposalProb(Ri, Rf):
             # Returns (unnormalized) proposal probability P(Rf | Ri)
             localGrad = self.gradLogWavefunction(parameters,Ri)
+            gradShift = localGrad * tau
             if self.clipGradients:
-                localGrad = clip(localGrad)
-            deviation = Rf - Ri - localGrad * tau
+                gradShift = clip(gradShift)
+            deviation = Rf - Ri - gradShift
             return jnp.exp(-jnp.sum(deviation**2) / (2 * tau))
                 
         shiftRng, acceptRng = jax.random.split(rng, 2)
 
         localGrad = self.gradLogWavefunction(parameters, rs1)
+        gradShift = localGrad * tau
         if self.clipGradients:
-            localGrad = clip(localGrad)
+            gradShift = clip(gradShift)
         
-        positionShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
-        rs2 = rs1 + localGrad * tau + positionShift
+        randomShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
+        rs2 = rs1 + gradShift + randomShift
 
         proposalRatio = proposalProb(rs2,rs1) / proposalProb(rs1,rs2)
         probRatio = jnp.exp(
