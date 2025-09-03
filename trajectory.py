@@ -83,7 +83,7 @@ class MALAUpdater:
         rngs = jax.random.split(rng, walkers)
         return self.updateWalkers(parameters, rs, rngs, tau)
 
-def wignerCrystal(spins, L, walkers, dim=3):
+def wignerCrystal(spins, r_ws, L, walkers, rng, dim=3):
     
     N = spins[0] + spins[1]
     NUp = spins[0]
@@ -100,8 +100,13 @@ def wignerCrystal(spins, L, walkers, dim=3):
     singleWalker = jnp.concatenate([
         upPositions[:NUp], downPositions[:NDown]
     ], axis=0)
+    allWalkers = jnp.broadcast_to(
+        singleWalker, (walkers,) + singleWalker.shape
+    )
 
-    return jnp.broadcast_to(singleWalker, (walkers,) + singleWalker.shape)
+    noise = (r_ws / 10) * jax.random.normal(rng, shape=allWalkers.shape)
+
+    return allWalkers + noise
 
 def acceptanceArray(rs1, rs2):
     """
