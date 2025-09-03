@@ -2,4 +2,5 @@
 big_*.npy
 slurm*.out
 *.ipynb
+.ipynb_checkpoints/
 __pycache__/
