@@ -1,0 +1,32 @@
+/burg-archive/home/phr2114/.conda/envs/nqs/lib/python3.9/site-packages/flax/struct.py:132: FutureWarning: jax.tree_util.register_keypaths is deprecated, and will be removed in a future release. Please use `register_pytree_with_keys()` instead.
+  jax.tree_util.register_keypaths(data_clz, keypaths)
+/burg-archive/home/phr2114/.conda/envs/nqs/lib/python3.9/site-packages/flax/struct.py:132: FutureWarning: jax.tree_util.register_keypaths is deprecated, and will be removed in a future release. Please use `register_pytree_with_keys()` instead.
+  jax.tree_util.register_keypaths(data_clz, keypaths)
+2025-08-22 17:52:47.799503: E external/xla/xla/stream_executor/cuda/cuda_driver.cc:268] failed call to cuInit: CUDA_ERROR_NO_DEVICE: no CUDA-capable device is detected
+No GPU/TPU found, falling back to CPU. (Set TF_CPP_MIN_LOG_LEVEL=0 and rerun for more info.)
+/burg/ccce/users/phr2114/vmc/qc.py:264: UserWarning: Explicitly requested dtype <class 'jax.numpy.complex128'> requested in zeros is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/google/jax#current-gotchas for more.
+  unitary = jnp.zeros((numkPoints, numkPoints), dtype=jnp.complex128)
+/burg/ccce/users/phr2114/vmc/qc.py:264: UserWarning: Explicitly requested dtype <class 'jax.numpy.complex128'> requested in zeros is not available, and will be truncated to dtype complex64. To enable more dtypes, set the jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell environment variable. See https://github.com/google/jax#current-gotchas for more.
+  unitary = jnp.zeros((numkPoints, numkPoints), dtype=jnp.complex128)
+/burg-archive/home/phr2114/.conda/envs/nqs/lib/python3.9/site-packages/pyscf/gto/mole.py:1300: UserWarning: Function mol.dumps drops attribute energy_nuc because it is not JSON-serializable
+  warnings.warn(msg)
+ENERGY: -0.6232114802052433
+ENERGY: -0.6220718688114311
+ENERGY: -0.6228824784466567
+ENERGY: -0.6231700270209113
+ENERGY: -0.6227446146992845
+ENERGY: -0.622933310094737
+ENERGY: -0.6229863161166909
+ENERGY: -0.6231331454012796
+ENERGY: -0.6233469642879845
+ENERGY: -0.622660827660849
+ENERGY: -0.6225702658912131
+ENERGY: -0.6227609498893214
+ENERGY: -0.623405784535527
+ENERGY: -0.6228641289438266
+ENERGY: -0.6223046821450497
+ENERGY: -0.6230292697680178
+ENERGY: -0.6226051980229109
+ENERGY: -0.6232113126390606
+ENERGY: -0.6231153697038779
+ENERGY: -0.6223352256396972
