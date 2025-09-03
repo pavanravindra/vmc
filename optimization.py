@@ -132,9 +132,9 @@ class StochasticReconfiguration:
         exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
 
         f_k = 2 * (exp_O * exp_H - exp_OH) * learningRateFlat
-
-        jk_traj = parameterGrads.T[:,None,:] * parameterGrads.T[None,:,:]
-        s_jk = jnp.average(jk_traj, axis=2) - jnp.outer(exp_O,exp_O)
+        
+        cov = (parameterGrads.T @ parameterGrads) / parameterGrads.shape[0]
+        s_jk = cov - jnp.outer(exp_O,exp_O)
         diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
         parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
         updatedParameters = unravel(flatParameters + parameterStep)
