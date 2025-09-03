@@ -1,3 +1,5 @@
 *trial*
 big_*.npy
 slurm*.out
+*.ipynb
+__pycache__/
