@@ -10,17 +10,27 @@ class LocalEnergy:
         return batchFunction(parameters, walkerRs)
 
 def laplacian(logWavefunction, parameters, rs):
+    """
+    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
+    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
+    the sum over coordinates without blowing up memory.
+    """
     def f_rs(rs):
         return logWavefunction(parameters, rs)
 
     grad_fn = jax.grad(f_rs)
+    rsFlat = rs.reshape(-1)
+    numCoords = rsFlat.size
 
-    rs_flat = rs.reshape(-1)
-    def unit_lapl(i):
-        e_i = jnp.eye(rs_flat.size)[i]   # ith unit vector
-        return jax.jvp(grad_fn, (rs,), (e_i.reshape(rs.shape),))[1].reshape(-1)[i]
+    def body(carry, i):
+        e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
+        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
+        lap = carry + secondDerivative
+        return ( lap , None )
 
-    return jnp.sum(jax.vmap(unit_lapl)(jnp.arange(rs_flat.size)))
+    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+    
+    return lap
 
 class LocalKineticEnergy(LocalEnergy):
     """
