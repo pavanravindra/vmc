@@ -30,9 +30,9 @@ tau = 1.25
 walkers = 1024
 
 eqSteps      = 2000
-trainSteps   = 100
+trainSteps   = 5000
 trainEqSteps = 20
-evalSteps    = 1000
+evalSteps    = 10000
 
 NUp = N // 2
 NDown = N - NUp

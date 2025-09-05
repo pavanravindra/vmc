@@ -1,6 +1,8 @@
 import sys, os
 
 sys.path.append("/burg-archive/ccce/users/phr2114/vmc")
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.numpy as jnp
@@ -76,10 +78,8 @@ updateParameters = jax.jit(optimizer)
 
 rng = jax.random.PRNGKey(558)
 
-rng, rs_rng = jax.random.split(rng, 2)
+rng, rs_rng, init_rng = jax.random.split(rng, 3)
 rs = trajectory.wignerCrystal(spins, r_ws, L, walkers, rs_rng, dim=3)
-
-rng, init_rng = jax.random.split(rng, 2)
 parameters = wavefunction.initBatch(init_rng, rs)
 
 
@@ -100,7 +100,7 @@ rng = jax.random.PRNGKey(1126)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((eqSteps,walkers), np.nan)
+acceptArrays = np.full((walkers,), 0)
 
 for dt in range(eqSteps):
 
@@ -115,7 +115,7 @@ for dt in range(eqSteps):
     acceptRate = trajectory.acceptanceRate(rs, newRs)
     
     acceptRates.append(acceptRate)
-    acceptArrays[dt,:] = trajectory.acceptanceArray(rs, newRs)
+    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
 
     if acceptRate < acceptMin:
         tau = tau * 0.9
@@ -195,7 +195,7 @@ rng = jax.random.PRNGKey(386)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((eqSteps,walkers), np.nan)
+acceptArrays = np.full((walkers,), 0)
 
 for dt in range(eqSteps):
 
@@ -210,7 +210,7 @@ for dt in range(eqSteps):
     acceptRate = trajectory.acceptanceRate(rs, newRs)
     
     acceptRates.append(acceptRate)
-    acceptArrays[dt,:] = trajectory.acceptanceArray(rs, newRs)
+    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
 
     if acceptRate < acceptMin:
         tau = tau * 0.9
@@ -240,7 +240,7 @@ rng = jax.random.PRNGKey(493)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((evalSteps,walkers), np.nan)
+acceptArrays = np.full((walkers,), 0)
 energies = np.full((evalSteps,walkers),np.nan)
 
 for dt in range(evalSteps):
@@ -257,7 +257,7 @@ for dt in range(evalSteps):
     acceptRate = trajectory.acceptanceRate(rs, newRs)
     
     acceptRates.append(acceptRate)
-    acceptArrays[dt,:] = trajectory.acceptanceArray(rs, newRs)
+    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
 
     rs = newRs
 
