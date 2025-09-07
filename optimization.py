@@ -115,7 +115,7 @@ class StochasticReconfiguration:
             self.getParameterGradient, in_axes=(None,0)
         )
 
-    def __call__(self, parameters, walkerRs, learningRate, diagonalShift=0.):
+    def __call__(self, parameters, walkerRs, learningRate, diagonalShift=0., maxNorm=jnp.inf):
         
         if isinstance(learningRate, (float, int)):
             learningRateTree = castFloatAsPytree(learningRate, parameters)
@@ -137,7 +137,18 @@ class StochasticReconfiguration:
         s_jk = cov - jnp.outer(exp_O,exp_O)
         diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
         parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
-        updatedParameters = unravel(flatParameters + parameterStep)
+        scale = jnp.minimum(1.0, maxNorm / jnp.linalg.norm(parameterStep))
+        updatedParameters = unravel(flatParameters + scale * parameterStep)
+
+        """
+        print(s_jk)
+        print(f_k)
+        print(scale)
+        print(parameterStep)
+        print(flatParameters + scale * parameterStep)
+
+        print("-------------------------------")
+        """
         
         return updatedParameters
 
