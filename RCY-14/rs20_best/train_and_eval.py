@@ -30,7 +30,7 @@ tau = 1.25
 walkers = 1024
 
 eqSteps      = 2000
-trainSteps   = 5000
+trainSteps   = 2000
 trainEqSteps = 20
 evalSteps    = 10000
 
@@ -42,7 +42,7 @@ L = wavefunctions.computeL(N, r_ws)
 
 ( acceptMin , acceptMax ) = ( 0.5 , 0.65 )
 
-T = 2000
+T = 1000
 diagonalShift = 1e-4
 
 
@@ -54,7 +54,7 @@ if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
 
-    hyperparameters[0] = optimization.logSample(1e-5,1e1)
+    hyperparameters[0] = optimization.logSample(1e-5,1e2)
 
     np.savetxt("hyperparameters.txt", hyperparameters)
 
