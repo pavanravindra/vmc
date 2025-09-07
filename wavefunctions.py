@@ -767,6 +767,8 @@ class LogFewBodyJastrowRHF(Wavefunction):
         
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
         self.linearSelf2 = nn.Dense(1)
+        self.linearCross1 = nn.Dense(self.hiddenFeatures)
+        self.linearCross2 = nn.Dense(1)
 
     def __call__(self, rs):
         
@@ -791,7 +793,7 @@ class LogFewBodyJastrowRHF(Wavefunction):
 
         v_ij = jnp.concatenate([cusplessDisps, matchMatrix], axis=-1)
         
-        selfTerm = decays * self.linearSelf2(nn.swish(self.linearSelf1(v_ij)))
+        selfTerm = self.linearSelf2(nn.swish(self.linearSelf1(v_ij)))
 
         """
         def crossTermFunction(v_i, decay_i):
@@ -810,13 +812,12 @@ class LogFewBodyJastrowRHF(Wavefunction):
         crossTerm = jnp.sum(
             jax.vmap(crossTermFunction, in_axes=(0,0))(v_ij, decays), axis=2
         )
-        
-        m_ij = decays * (selfTerm + crossTerm)
-        
-        MBJastrow = jnp.sum(decays * self.linearFinal2(nn.swish(self.linearFinal1(h_ij))))
-        """
 
-        MBJastrow = jnp.sum(selfTerm)
+        m_ij = decays * (selfTerm + crossTerm)
+        """
+        
+        m_ij = decays * selfTerm
+        MBJastrow = jnp.sum(m_ij)
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
 
