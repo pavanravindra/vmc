@@ -766,12 +766,7 @@ class LogFewBodyJastrowRHF(Wavefunction):
         self.decay = DecayFunction(self.L)
         
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
-        self.linearSelf2 = nn.Dense(self.hiddenFeatures)
-        #self.linearCross1 = nn.Dense(self.hiddenFeatures)
-        #self.linearCross2 = nn.Dense(self.hiddenFeatures)
-
-        self.linearFinal1 = nn.Dense(self.hiddenFeatures)
-        self.linearFinal2 = nn.Dense(1)
+        self.linearSelf2 = nn.Dense(1)
 
     def __call__(self, rs):
         
@@ -817,10 +812,11 @@ class LogFewBodyJastrowRHF(Wavefunction):
         )
         
         m_ij = decays * (selfTerm + crossTerm)
+        
+        MBJastrow = jnp.sum(decays * self.linearFinal2(nn.swish(self.linearFinal1(h_ij))))
         """
 
-        h_ij = selfTerm
-        MBJastrow = jnp.sum(decays * self.linearFinal2(nn.swish(self.linearFinal1(h_ij))))
+        MBJastrow = jnp.sum(selfTerm)
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
 
