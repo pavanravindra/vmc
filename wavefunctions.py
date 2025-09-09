@@ -793,31 +793,41 @@ class LogFewBodyJastrowRHF(Wavefunction):
 
         v_ij = jnp.concatenate([cusplessDisps, matchMatrix], axis=-1)
         
-        selfTerm = self.linearSelf2(nn.swish(self.linearSelf1(v_ij)))
+        selfTerm = decays * self.linearSelf2(nn.swish(self.linearSelf1(v_ij)))
 
         """
-        def crossTermFunction(v_i, decay_i):
-            def f(j_idx):
-                local_v_ij = jnp.broadcast_to(v_i[j_idx], (N,4))
-                local_v_ik = v_i
-                local_input = jnp.concatenate(
-                    [local_v_ij, local_v_ik], axis=-1
-                )
-                local_output = self.linearCross2(
-                    nn.swish(self.linearCross1(local_input))
-                )
-                return local_output * decay_i
-            return jax.vmap(f)(jnp.arange(N))
-
-        crossTerm = jnp.sum(
-            jax.vmap(crossTermFunction, in_axes=(0,0))(v_ij, decays), axis=2
-        )
-
-        m_ij = decays * (selfTerm + crossTerm)
+        # Numpy reference implementation
+        test = np.zeros((N,N,1))
+        for i in range(N):
+            for j in range(N):
+                for k in range(N):
+                    localDecay = decays[i,j,0] * decays[i,k,0] * decays[j,k,0]
+                    localInput = np.concatenate([v_ij[i,j,:], v_ij[i,k,:]], axis=-1)
+                    localNeural = self.linearCross2(nn.swish(self.linearCross1(localInput)))[0]
+                    test[i,j,0] += localDecay * localNeural
         """
-        
-        m_ij = decays * selfTerm
-        MBJastrow = jnp.sum(m_ij)
+
+        def f(i, j):
+            d_ij = decays[i, j, 0]                         # scalar
+            d_ik = decays[i, :, 0]                         # (N,)
+            d_jk = decays[j, :, 0]                         # (N,)
+            localDecay = d_ij * d_ik * d_jk                # (N,)
+    
+            localInput = jnp.concatenate(
+                [jnp.repeat(v_ij[i, j, :][None, :], N, axis=0),  # (N, 4)
+                 v_ij[i, :, :]],                                 # (N, 4)
+                axis=-1                                          # (N, 8)
+            )
+    
+            hidden = nn.swish(self.linearCross1(localInput))         # (N, H)
+            localNeural = self.linearCross2(hidden)[:, 0]            # (N,)
+            return jnp.sum(localDecay * localNeural)
+
+        f_vmap = jax.vmap(jax.vmap(f, in_axes=(None, 0)), in_axes=(0, None))
+        crossTerm = f_vmap(jnp.arange(N), jnp.arange(N))[..., None]
+
+        h_ij = selfTerm + crossTerm
+        MBJastrow = jnp.sum(h_ij)
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
 
