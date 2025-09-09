@@ -83,8 +83,6 @@ rng, rs_rng, init_rng = jax.random.split(rng, 3)
 rs = trajectory.wignerCrystal(spins, r_ws, L, walkers, rs_rng, dim=3)
 parameters = wavefunction.initBatch(init_rng, rs)
 
-maxNorm = jnp.linalg.norm(parameters['params']['CYJastrow']['As_same_diff']) / 10
-
 
 ###############################################################################
 #   Assign sampled hyperparameters to useful things                           #
@@ -156,6 +154,7 @@ for dt in range(trainSteps):
     print(parameters['params']['CYJastrow'])
 
     localLearningRate = optimization.scalarTimesParams(1 / (1 + (dt / T)), eta0)
+    maxNorm = 0.5 * jnp.min(jnp.abs(parameters['params']['CYJastrow']['As_same_diff']))
     newParameters = updateParameters(parameters, rs, localLearningRate, diagonalShift, maxNorm)
 
     if optimization.hasnan(newParameters):
