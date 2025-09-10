@@ -68,7 +68,7 @@ print("HYPERPARAMETERS: " + str(hyperparameters))
 ###############################################################################
 
 #wavefunction = wavefunctions.LogSlaterCYJastrow(spins, L)
-wavefunction = wavefunctions.LogFewBodyJastrowRHF(spins, L, 16)
+wavefunction = wavefunctions.LogTwoBodyJastrowRHF(spins, L, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
 optimizer = optimization.StochasticReconfiguration(wavefunction, localEnergy)
@@ -145,17 +145,21 @@ print("Starting optimization...")
 rng = jax.random.PRNGKey(151)
 
 startRs = rs
+rsHistory = []
+parametersHistory = []
 
 for dt in range(trainSteps):
 
     if dt % 100 == 0:
         print("Step {}".format(dt))
 
-    print(parameters['params']['CYJastrow'])
+    print(parameters['params'])
+
+    rsHistory.append(rs)
 
     localLearningRate = optimization.scalarTimesParams(1 / (1 + (dt / T)), eta0)
     maxNorm = 0.5 * jnp.min(jnp.abs(parameters['params']['CYJastrow']['As_same_diff']))
-    newParameters = updateParameters(parameters, rs, localLearningRate, diagonalShift, maxNorm)
+    newParameters = updateParameters(parameters, rs, localLearningRate, diagonalShift)
 
     if optimization.hasnan(newParameters):
         np.savetxt("FAILED_REEQUILIBRATE", [])
@@ -164,6 +168,7 @@ for dt in range(trainSteps):
         )
         np.save("big_startRs.npy", startRs)
         np.save("big_endRs.npy", rs)
+        np.save("big_rsHistory.npy", np.array(rsHistory))
         raise Exception("Parameters have somehow NaNed...")
 
     parameters = newParameters
