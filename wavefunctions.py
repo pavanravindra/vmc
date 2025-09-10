@@ -798,6 +798,93 @@ class LogTwoBodyJastrowRHF(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
 
+class LogThreeBodyJastrowRHF(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: RHF ground state
+    - Jastrow: Coulomb-Yukawa + neural Jastrow with only one round of message
+               passing
+    """
+    spins : (int,int)
+    L : float
+    hiddenFeatures : int
+
+    def setup(self):
+        
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        
+        self.decay = DecayFunction(self.L)
+        
+        self.linearSelf1 = nn.Dense(self.hiddenFeatures)
+        self.linearSelf2 = nn.Dense(1)
+        self.linearThree1 = nn.Dense(self.hiddenFeatures)
+        self.linearThree2 = nn.Dense(1)
+
+    def __call__(self, rs):
+        
+        slaterUp = self.slaterUp(rs[:self.spins[0],:])
+        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        disps = (disps + self.L/2) % self.L - self.L/2
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+        r_ij = jnp.linalg.norm(disps, axis=-1)
+        decays = self.decay(r_ij)[:,:,None]
+        decays = jnp.where(mask, decays, 0.0)
+        
+        cusplessDisps = jnp.cos(jnp.pi * disps / self.L)
+
+        N = self.spins[0] + self.spins[1]
+        electronIdxs = jnp.arange(N)
+        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
+        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
+
+        v_ij = jnp.concatenate([cusplessDisps, matchMatrix], axis=-1)
+        
+        selfTerm = decays * self.linearSelf2(nn.swish(self.linearSelf1(v_ij)))
+
+        """
+        # Numpy reference implementation
+        test_G = np.zeros((N,3))
+        for l in range(N):
+            for i in range(N):
+                if i == l:
+                    continue;
+                localDecay = decays[i,l,0]
+                localDisp = disps[i,l,:]
+                localVij = v_ij[i,l,:]
+                localCorrelator = self.linearThree2(nn.swish(self.linearThree1(localVij)))[0]
+                test_G[l] += localDecay * localCorrelator * localDisp / N
+
+        test_U3 = 0.0
+        for l in range(N):
+            test_U3 += test_G[l] @ test_G[l]
+        """
+
+        def compute_G_l(l):
+            # map over i
+            def body(i):
+                localDecay = decays[i, l, 0]
+                localDisp = disps[i, l, :]          # (3,)
+                localVij = v_ij[i, l, :]            # (F,)
+                hidden = nn.swish(self.linearThree1(localVij))
+                localCorrelator = self.linearThree2(hidden)[0]   # scalar
+                return localDecay * localCorrelator * localDisp  # (3,)
+    
+            G_l = jax.vmap(body)(jnp.arange(N))    # (N, 3)
+            return jnp.average(G_l, axis=0)            # (3,)
+    
+        G = jax.vmap(compute_G_l)(jnp.arange(N))   # (N, 3)
+        U3 = jnp.sum(jnp.sum(G * G, axis=-1))  # sum of squared norms
+        
+        MBJastrow = jnp.sum(selfTerm) + U3
+        
+        return slaterUp + slaterDown + CYJastrow + MBJastrow
+
 class LogFewBodyJastrowRHF(Wavefunction):
     """
     Slater-Jastrow wavefunction with following specs:
