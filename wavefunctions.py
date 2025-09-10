@@ -873,7 +873,7 @@ class LogFewBodyJastrowRHF(Wavefunction):
     
             hidden = nn.swish(self.linearCross1(localInput))         # (N, H)
             localNeural = self.linearCross2(hidden)[:, 0]            # (N,)
-            return jnp.sum(localDecay * localNeural)
+            return jnp.average(localDecay * localNeural)
 
         f_vmap = jax.vmap(jax.vmap(f, in_axes=(None, 0)), in_axes=(0, None))
         crossTerm = f_vmap(jnp.arange(N), jnp.arange(N))[..., None]
