@@ -720,10 +720,10 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localCorrelator * localDisp
             G_l = jax.vmap(body)(jnp.arange(N))
-            return jnp.average(G_l, axis=0)
+            return jnp.sum(G_l, axis=0)
     
         G = jax.vmap(compute_G_l)(jnp.arange(N))
-        U3 = jnp.sum(G * G)
+        U3 = jnp.sum(G * G) / jnp.sqrt(6 * N**3)
         
         MBJastrow = jnp.sum(selfTerm) + U3
         
@@ -826,7 +826,7 @@ class LogThreePavanJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localVij * localDisp
             K_l = jax.vmap(key)(jnp.arange(N))
-            return jnp.average(K_l, axis=0)
+            return jnp.sum(K_l, axis=0)
 
         def compute_Q(l):
             def query(i):
@@ -837,11 +837,12 @@ class LogThreePavanJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localVij * localDisp
             Q_l = jax.vmap(query)(jnp.arange(N))
-            return jnp.average(Q_l, axis=0)
+            return jnp.sum(Q_l, axis=0)
 
         K = jax.vmap(compute_K)(jnp.arange(N))
         Q = jax.vmap(compute_Q)(jnp.arange(N))
-        U3 = jnp.sum(K * Q)
+        d = self.hiddenFeatures
+        U3 = jnp.sum(K * Q) / jnp.sqrt(d * N**3)
         
         MBJastrow = jnp.sum(selfTerm) + U3
         
