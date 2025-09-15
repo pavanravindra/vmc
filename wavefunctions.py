@@ -751,11 +751,11 @@ class LogThreePavanJastrowRHF(Wavefunction):
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
         self.linearSelf2 = nn.Dense(1)
 
-        self.queryMatrix = nn.Dense(self.hiddenFeatures)
+        self.queryMatrix = nn.Dense(self.hiddenFeatures, use_bias=False)
         self.etaQuery1 = nn.Dense(self.hiddenFeatures)
         self.etaQuery2 = nn.Dense(1)
         
-        self.keyMatrix = nn.Dense(self.hiddenFeatures)
+        self.keyMatrix = nn.Dense(self.hiddenFeatures, use_bias=False)
         self.etaKey1 = nn.Dense(self.hiddenFeatures)
         self.etaKey2 = nn.Dense(1)
 
@@ -809,8 +809,8 @@ class LogThreePavanJastrowRHF(Wavefunction):
                 localQueryDisp = self.queryMatrix(localDisp)
                 localQuery = localDecay * localQueryCorrelator * localQueryDisp
 
-                test_K[l,:] += localKey
-                test_Q[l,:] += localQuery
+                test_K[l,:] += localKey / N
+                test_Q[l,:] += localQuery / N
 
         test_U3 = 0.0
         for l in range(N):
@@ -826,7 +826,7 @@ class LogThreePavanJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localVij * localDisp
             K_l = jax.vmap(key)(jnp.arange(N))
-            return jnp.sum(K_l, axis=0)
+            return jnp.average(K_l, axis=0)
 
         def compute_Q(l):
             def query(i):
@@ -837,7 +837,7 @@ class LogThreePavanJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localVij * localDisp
             Q_l = jax.vmap(query)(jnp.arange(N))
-            return jnp.sum(Q_l, axis=0)
+            return jnp.average(Q_l, axis=0)
 
         K = jax.vmap(compute_K)(jnp.arange(N))
         Q = jax.vmap(compute_Q)(jnp.arange(N))
@@ -846,4 +846,3 @@ class LogThreePavanJastrowRHF(Wavefunction):
         MBJastrow = jnp.sum(selfTerm) + U3
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
-        
