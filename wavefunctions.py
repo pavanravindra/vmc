@@ -703,7 +703,7 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
                 localDisp = disps[i,l,:]
                 localVij = v_ij[i,l,:]
                 localCorrelator = self.linearThree2(nn.swish(self.linearThree1(localVij)))[0]
-                test_G[l] += localDecay * localCorrelator * localDisp
+                test_G[l] += localDecay * localCorrelator * localDisp / N
 
         test_U3 = 0.0
         for l in range(N):
@@ -720,7 +720,7 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
                 )[0]
                 return localDecay * localCorrelator * localDisp
             G_l = jax.vmap(body)(jnp.arange(N))
-            return jnp.sum(G_l, axis=0)
+            return jnp.average(G_l, axis=0)
     
         G = jax.vmap(compute_G_l)(jnp.arange(N))
         U3 = jnp.sum(G * G)
