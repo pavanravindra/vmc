@@ -68,7 +68,7 @@ print("HYPERPARAMETERS: " + str(hyperparameters))
 ###############################################################################
 
 #wavefunction = wavefunctions.LogSlaterCYJastrow(spins, L)
-wavefunction = wavefunctions.LogFewBodyJastrowRHF(spins, L, 16)
+wavefunction = wavefunctions.LogThreePavanJastrowRHF(spins, L, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
 optimizer = optimization.StochasticReconfiguration(wavefunction, localEnergy)
