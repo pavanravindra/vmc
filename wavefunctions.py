@@ -649,8 +649,8 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
     Slater-Jastrow wavefunction with following specs:
     - Slater: RHF ground state
     - Jastrow: Coulomb-Yukawa + neural two-body + Ceperley's three-body correlator
-        NOTE: The eta function is neural here so it's slightly better than
-              Ceperley's version of the three-body correlator.
+        NOTE: This is slightly better than Ceperley's correlator since the eta
+              function is neural and uses spin information.
     """
     spins : (int,int)
     L : float
@@ -703,7 +703,7 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
                 localDisp = disps[i,l,:]
                 localVij = v_ij[i,l,:]
                 localCorrelator = self.linearThree2(nn.swish(self.linearThree1(localVij)))[0]
-                test_G[l] += localDecay * localCorrelator * localDisp / N
+                test_G[l] += localDecay * localCorrelator * localDisp
 
         test_U3 = 0.0
         for l in range(N):
@@ -711,20 +711,19 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
         """
 
         def compute_G_l(l):
-            # map over i
             def body(i):
                 localDecay = decays[i,l,0]
-                localDisp = disps[i,l,:]          # (3,)
-                localVij = v_ij[i,l,:]            # (F,)
-                hidden = nn.swish(self.linearThree1(localVij))
-                localCorrelator = self.linearThree2(hidden)[0]   # scalar
-                return localDecay * localCorrelator * localDisp  # (3,)
+                localDisp = disps[i,l,:]
+                localVij = v_ij[i,l,:]
+                localCorrelator = self.linearThree2(
+                    nn.swish(self.linearThree1(localVij))
+                )[0]
+                return localDecay * localCorrelator * localDisp
+            G_l = jax.vmap(body)(jnp.arange(N))
+            return jnp.sum(G_l, axis=0)
     
-            G_l = jax.vmap(body)(jnp.arange(N))    # (N, 3)
-            return jnp.average(G_l, axis=0)            # (3,)
-    
-        G = jax.vmap(compute_G_l)(jnp.arange(N))   # (N, 3)
-        U3 = jnp.sum(jnp.sum(G * G, axis=-1))  # sum of squared norms
+        G = jax.vmap(compute_G_l)(jnp.arange(N))
+        U3 = jnp.sum(G * G)
         
         MBJastrow = jnp.sum(selfTerm) + U3
         
@@ -748,14 +747,17 @@ class LogThreePavanJastrowRHF(Wavefunction):
         self.CYJastrow = LogCYJastrow(self.spins, self.L)
         
         self.decay = DecayFunction(self.L)
-
-        self.queryMatrix = nn.Dense(self.hiddenFeatures)
-        self.keyMatrix = nn.Dense(self.hiddenFeatures)
-        self.value1 = nn.Dense(self.hiddenFeatures)
-        self.value2 = nn.Dense(1)
         
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
         self.linearSelf2 = nn.Dense(1)
+
+        self.queryMatrix = nn.Dense(self.hiddenFeatures)
+        self.etaQuery1 = nn.Dense(self.hiddenFeatures)
+        self.etaQuery2 = nn.Dense(1)
+        
+        self.keyMatrix = nn.Dense(self.hiddenFeatures)
+        self.etaKey1 = nn.Dense(self.hiddenFeatures)
+        self.etaKey2 = nn.Dense(1)
 
     def __call__(self, rs):
         
@@ -782,33 +784,66 @@ class LogThreePavanJastrowRHF(Wavefunction):
         
         selfTerm = jnp.sum(decays * self.linearSelf2(nn.swish(self.linearSelf1(v_ij))))
 
-        queries = self.queryMatrix(v_ij)
-        keys = self.keyMatrix(v_ij)
-        values = self.value2(nn.swish(self.value1(v_ij)))
-
-        U3 = jnp.einsum(
-            'ij,ik,ijd,ikd,ij,ik->',
-            decays[..., 0],   # (N, N)
-            decays[..., 0],   # (N, N)
-            queries,          # (N, N, D)
-            keys,             # (N, N, D)
-            values[..., 0],   # (N, N)
-            values[..., 0]    # (N, N)
-        ) / N
-
         """
-        # Numpy reference immplementation
-        testU3 = 0
-        for i in range(N):
-            for j in range(N):
-                for k in range(N):
-                    localDecay = decays[i,j,0] * decays[i,k,0]
-                    localQuery = queries[i,j,:]
-                    localKey = keys[i,k,:]
-                    localValue = values[i,j,0] * values[i,k,0]
-                    testU3 += localDecay * jnp.dot(localQuery, localKey) * localValue
+        # Numpy reference implementation
+        test_K = np.zeros((N,self.hiddenFeatures))
+        test_Q = np.zeros((N,self.hiddenFeatures))
+        
+        for l in range(N):
+        
+            for i in range(N):
+                
+                localDecay = decays[i,l,0]
+                localDisp = disps[i,l,:]
+                localVij = v_ij[i,l,:]
+
+                localKeyCorrelator = self.etaKey2(
+                    nn.swish(self.etaKey1(localVij))
+                )[0]
+                localKeyDisp = self.keyMatrix(localDisp)
+                localKey = localDecay * localKeyCorrelator * localKeyDisp
+
+                localQueryCorrelator = self.etaQuery2(
+                    nn.swish(self.etaQuery1(localVij))
+                )[0]
+                localQueryDisp = self.queryMatrix(localDisp)
+                localQuery = localDecay * localQueryCorrelator * localQueryDisp
+
+                test_K[l,:] += localKey
+                test_Q[l,:] += localQuery
+
+        test_U3 = 0.0
+        for l in range(N):
+            test_U3 += test_K[l] @ test_Q[l]
         """
         
-        MBJastrow = selfTerm + U3
+        def compute_K(l):
+            def key(i):
+                localDecay = decays[i,l,0]
+                localDisp = self.keyMatrix(disps[i,l,:])
+                localVij = self.etaKey2(
+                    nn.swish(self.etaKey1(v_ij[i,l,:]))
+                )[0]
+                return localDecay * localVij * localDisp
+            K_l = jax.vmap(key)(jnp.arange(N))
+            return jnp.sum(K_l, axis=0)
+
+        def compute_Q(l):
+            def query(i):
+                localDecay = decays[i,l,0]
+                localDisp = self.queryMatrix(disps[i,l,:])
+                localVij = self.etaQuery2(
+                    nn.swish(self.etaQuery1(v_ij[i,l,:]))
+                )[0]
+                return localDecay * localVij * localDisp
+            Q_l = jax.vmap(query)(jnp.arange(N))
+            return jnp.sum(Q_l, axis=0)
+
+        K = jax.vmap(compute_K)(jnp.arange(N))
+        Q = jax.vmap(compute_Q)(jnp.arange(N))
+        U3 = jnp.sum(K * Q)
+        
+        MBJastrow = jnp.sum(selfTerm) + U3
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
+        
