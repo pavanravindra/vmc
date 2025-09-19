@@ -54,7 +54,7 @@ if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
 
-    hyperparameters[0] = optimization.logSample(1e-5,1e2)
+    hyperparameters[0] = optimization.logSample(1e-3,1e2)
 
     np.savetxt("hyperparameters.txt", hyperparameters)
 
