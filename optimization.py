@@ -151,7 +151,7 @@ class StochasticReconfiguration:
         print("-------------------------------")
         """
         
-        return updatedParameters
+        return ( scale < 0.99 , localEnergies , updatedParameters )
 
     def getParameterGradient(self, parameters, rs):
         localParameterGrads = self.parameterGrad(parameters, rs)

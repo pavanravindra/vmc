@@ -40,7 +40,7 @@ spins = ( NUp , NDown )
 
 L = wavefunctions.computeL(N, r_ws)
 
-( acceptMin , acceptMax ) = ( 0.5 , 0.65 )
+( acceptMin , acceptMax ) = ( 0.55 , 0.65 )
 
 T = 1000
 diagonalShift = 1e-4
@@ -53,9 +53,7 @@ diagonalShift = 1e-4
 if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
-
-    hyperparameters[0] = optimization.logSample(1e-3,1e2)
-
+    hyperparameters[0] = optimization.logSample(1e-4,5e2)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
@@ -101,14 +99,14 @@ rng = jax.random.PRNGKey(1126)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((walkers,), 0)
+acceptArrays = np.zeros(walkers)
 
 for dt in range(eqSteps):
 
     if dt % 100 == 0:
         avgRate = np.average(np.array(acceptRates))
         acceptRates = []
-        print("Step {} : {} acceptance rate : tau = {}".format(dt,avgRate,tau))
+        print("Step {:5d}   Acc Rate {:4f}   tau = {:.5f}".format(dt,avgRate,tau))
 
     rng, traj_rng = jax.random.split(rng, 2)
     newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
@@ -127,7 +125,9 @@ for dt in range(eqSteps):
 
 print("Finished equilibration!\n")
 
-if np.min(np.average(acceptArrays, axis=0)) < 0.05:
+print(np.sort(acceptArrays)[:10])
+
+if np.min(acceptArrays) < 0.4:
     np.savetxt("FAILED_EQUILIBRATE", [])
     np.save("big_acceptArrays.npy", acceptArrays)
     np.save("big_startRs.npy", startRs)
@@ -145,20 +145,13 @@ print("Starting optimization...")
 rng = jax.random.PRNGKey(151)
 
 startRs = rs
-rsHistory = []
 
 for dt in range(trainSteps):
 
-    if dt % 100 == 0:
-        print("Step {}".format(dt))
-
-    print(parameters['params'])
-
-    rsHistory.append(rs)
-
     localLearningRate = optimization.scalarTimesParams(1 / (1 + (dt / T)), eta0)
-    maxNorm = 0.5 * jnp.min(jnp.abs(parameters['params']['CYJastrow']['As_same_diff']))
-    newParameters = updateParameters(parameters, rs, localLearningRate, diagonalShift)
+    ( maxNorm , currentEnergies , newParameters ) = updateParameters(
+        parameters, rs, localLearningRate, diagonalShift
+    )
 
     if optimization.hasnan(newParameters):
         np.savetxt("FAILED_REEQUILIBRATE", [])
@@ -167,10 +160,11 @@ for dt in range(trainSteps):
         )
         np.save("big_startRs.npy", startRs)
         np.save("big_endRs.npy", rs)
-        np.save("big_rsHistory.npy", np.array(rsHistory))
         raise Exception("Parameters have somehow NaNed...")
 
     parameters = newParameters
+
+    acceptArrays = np.zeros(walkers)
 
     for _ in range(trainEqSteps):
 
@@ -183,7 +177,14 @@ for dt in range(trainSteps):
         elif acceptRate > acceptMax:
             tau = tau * 1.1
 
+        acceptArrays += trajectory.acceptanceArray(rs, newRs) / trainEqSteps
+
         rs = newRs
+
+    print("Step {:5d}   Energy: {:.5f}   Norm: {:5}   Min Acc: {:.3f}   Avg Acc: {:.3f}".format(
+        dt, jnp.average(currentEnergies) / N, maxNorm,
+        np.min(acceptArrays), np.average(acceptArrays)
+    ))
 
 print("Finished optimization!\n")
 
@@ -202,14 +203,14 @@ rng = jax.random.PRNGKey(386)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((walkers,), 0)
+acceptArrays = np.zeros(walkers)
 
 for dt in range(eqSteps):
 
     if dt % 100 == 0:
         avgRate = np.average(np.array(acceptRates))
         acceptRates = []
-        print("Step {} : {} acceptance rate : tau = {}".format(dt,avgRate,tau))
+        print("Step {:5d}   Acc Rate {:4f}   tau = {:.5f}".format(dt,avgRate,tau))
 
     rng, traj_rng = jax.random.split(rng, 2)
     newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
@@ -228,7 +229,9 @@ for dt in range(eqSteps):
 
 print("Finished equilibration!\n")
 
-if np.min(np.average(acceptArrays, axis=0)) < 0.05:
+print(np.sort(acceptArrays)[:10])
+
+if np.min(acceptArrays) < 0.4:
     np.savetxt("FAILED_REEQUILIBRATE", [])
     np.save("big_acceptArrays.npy", acceptArrays)
     np.save("big_startRs.npy", startRs)
@@ -247,7 +250,7 @@ rng = jax.random.PRNGKey(493)
 
 startRs = rs
 acceptRates = [np.nan]
-acceptArrays = np.full((walkers,), 0)
+acceptArrays = np.zeros(walkers)
 energies = np.full((evalSteps,walkers),np.nan)
 
 for dt in range(evalSteps):
@@ -255,7 +258,7 @@ for dt in range(evalSteps):
     if dt % 1000 == 0:
         avgRate = np.average(np.array(acceptRates))
         acceptRates = []
-        print("Step {} : {} acceptance rate : tau = {}".format(dt,avgRate,tau))
+        print("Step {:5d}   Acc Rate {:4f}   tau = {:.5f}".format(dt,avgRate,tau))
 
     rng, traj_rng = jax.random.split(rng, 2)
     energies[dt,:] = computeEnergies(parameters, rs) / N
@@ -264,7 +267,7 @@ for dt in range(evalSteps):
     acceptRate = trajectory.acceptanceRate(rs, newRs)
     
     acceptRates.append(acceptRate)
-    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
+    acceptArrays += trajectory.acceptanceArray(rs, newRs) / evalSteps
 
     rs = newRs
 
@@ -272,7 +275,9 @@ averageEnergies = np.average(energies, axis=1)
 
 print("Finished energy evaluation!\n")
 
-if np.min(np.average(acceptArrays, axis=0)) < 0.05:
+print(np.sort(acceptArrays)[:10])
+
+if np.min(acceptArrays) < 0.4:
     np.savetxt("DEADWALKER", [])
     np.save("big_acceptArrays.npy", acceptArrays)
     np.save("big_startRs.npy", startRs)
