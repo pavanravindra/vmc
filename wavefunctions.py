@@ -855,7 +855,6 @@ class LogMessagePassingJastrow(Wavefunction):
     - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
 
     TODO:
-    - add in decay on messages if things aren't variational anymore...
     - richer v_ij (e.g., with sines and magnitude)
       - but make sure cusp conditions are maintained!
     """
@@ -970,9 +969,7 @@ class LogMessagePassingJastrow(Wavefunction):
             )
 
             mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
-            # TODO: this is where you could just multiply by decays if you want to try decaying the messages...
-            masked_mijt = jnp.where(mask, mijt, 0.0)
-            acc_mijt = jnp.sum(masked_mijt, axis=1)
+            acc_mijt = jnp.sum(mijt * decays, axis=1)
             
             hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
                 jnp.concatenate([acc_mijt,git], axis=-1)
