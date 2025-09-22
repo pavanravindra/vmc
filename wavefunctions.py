@@ -950,8 +950,8 @@ class LogMessagePassingJastrow(Wavefunction):
             git = hit
             gijt = jnp.concatenate([hijt,vij], axis=-1)
 
-            qijt = self.Wqt[t](gijt)
-            kijt = self.Wkt[t](gijt)
+            qijt = self.Wqt[t](gijt) * decays
+            kijt = self.Wkt[t](gijt) * decays
             
             """
             # Numpy reference implementation
