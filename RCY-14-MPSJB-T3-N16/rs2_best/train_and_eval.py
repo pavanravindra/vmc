@@ -23,7 +23,7 @@ start = time.time()
 #   Settings for whole simulation                                             #
 ###############################################################################
 
-r_ws = 5
+r_ws = 2
 N = 14
 tau = 1.25
 
@@ -66,7 +66,7 @@ print("HYPERPARAMETERS: " + str(hyperparameters))
 ###############################################################################
 
 wavefunction = wavefunctions.LogMessagePassingSJB(
-    spins, L, 3, 16, 16, 16, 7
+    spins, L, 3, 16, 16, 9, 7
 )
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
