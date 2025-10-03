@@ -250,330 +250,6 @@ class LogSlaterCYJastrow(Wavefunction):
         slaterDown = self.slaterDown(rs[self.spins[0]:,:])
         CYJastrow = self.CYJastrow(rs)
         return slaterUp + slaterDown + CYJastrow
-
-class NeuralDecayedFunction(nn.Module):
-    """
-    This is a neural function that takes in a list of one-dimensional inputs
-    and spits out a list of the one-dimensional outputs.
-    
-    Importantly, the output is damped so that it fades to 0 for larger input
-    values. The damping forces the function and all of its higher order
-    derivatives to fade to 0 at L/2.
-
-    Additionally, we make sure that the function is cuspless, in that it's
-    first derivatve approaches 0 as the input approaches 0.
-    """
-    L : float
-    hiddenLayers : int = 1
-    hiddenFeatures : int = 32
-
-    def setup(self):
-        self.hiddenLayerStack = [
-            nn.Dense(self.hiddenFeatures) for _ in range(self.hiddenLayers)
-        ]
-        self.outputLayer = nn.Dense(1)
-
-    def __call__(self, x):
-        
-        x_cut = self.L / 2
-        x = jnp.clip(x / x_cut, a_min=0.0, a_max=1.0-1e-5)
-        decay = jnp.exp(1 - 1 / (1 - x**2))
-        h = decay[:,None]
-        #h = jnp.cos(jnp.pi * x)[:,None] # Makes function cuspless
-        for layer in self.hiddenLayerStack:
-            h = nn.swish(layer(h))
-        networkOutput = self.outputLayer(h).flatten()
-        return networkOutput * decay
-
-class Backflow(nn.Module):
-    """
-    A pairwise neural backflow coordinate transform. The forward pass takes in
-    electron positions and returns updated electron positions that are
-    determined by a neural network acting on the scalar distance between a pair
-    of electrons.
-
-    The backflow transformation pushes coordinates in the direction of the
-    vector $r_i - r_j$.
-    """
-    spins: (int,int)
-    L: float
-    hiddenLayers : int = 1
-    hiddenFeatures : int = 32
-
-    def setup(self):
-        N = self.spins[0] + self.spins[1]
-        self.neuralFunctionSame = NeuralDecayedFunction(
-            self.L, self.hiddenLayers, self.hiddenFeatures
-        )
-        self.neuralFunctionDiff = NeuralDecayedFunction(
-            self.L, self.hiddenLayers, self.hiddenFeatures
-        )
-
-    def __call__(self, rs):
-            
-        N = self.spins[0] + self.spins[1]
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.sqrt(jnp.sum(disps**2, axis=-1) + 1e-15)
-
-        bothUpr_ij = r_ij[:self.spins[0],:self.spins[0]]
-        bothDownr_ij = r_ij[self.spins[0]:,self.spins[0]:]
-        upDownr_ij = r_ij[self.spins[0]:,:self.spins[0]]
-
-        bothUpForces = jnp.reshape(
-            self.neuralFunctionSame(jnp.reshape(
-                bothUpr_ij, (-1,)
-            )),
-            bothUpr_ij.shape
-        )
-        bothDownForces = jnp.reshape(
-            self.neuralFunctionSame(jnp.reshape(
-                bothDownr_ij, (-1,)
-            )),
-            bothDownr_ij.shape
-        )
-        upDownForces = jnp.reshape(
-            self.neuralFunctionDiff(jnp.reshape(
-                upDownr_ij, (-1,)
-            )),
-            upDownr_ij.shape
-        )
-
-        backflowForces = jnp.zeros((N,N))
-        backflowForces = backflowForces.at[:self.spins[0],:self.spins[0]].set(bothUpForces)
-        backflowForces = backflowForces.at[self.spins[0]:,self.spins[0]:].set(bothDownForces)
-        backflowForces = backflowForces.at[self.spins[0]:,:self.spins[0]].set(upDownForces)
-        backflowForces = backflowForces.at[:self.spins[0],self.spins[0]:].set(upDownForces.T)
-        backflowForces = jnp.where(mask[:,:,0], backflowForces, 0.0)
-        
-        backflow = jnp.sum(backflowForces[:,:,None] * disps, axis=1)
-        xs = rs + backflow
-
-        return xs
-    
-class SlaterCYJastrowNeuralBackflow(Wavefunction):
-    """
-    Slater-Jastrow-Backflow wavefunction with the following:
-    - Slater: two simple RHF slater determinants
-    - Jastrow: Coulomb-Yukawa
-    - Backflow: sum of neural pairwise backflow shifts
-    """
-    spins : (int,int)
-    L : float
-    hiddenLayers : int = 1
-    hiddenFeatures : int = 32
-
-    def setup(self):
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-        self.backflow = Backflow(
-            self.spins, self.L, self.hiddenLayers, self.hiddenFeatures
-        )
-
-    def __call__(self, rs):
-
-        xs = self.backflow(rs)
-        
-        xsUp = xs[:self.spins[0],:]
-        xsDown = xs[self.spins[0]:,:]
-        
-        slaterUp = self.slaterUp(xsUp)
-        slaterDown = self.slaterDown(xsDown)
-        CYJastrow = self.CYJastrow(rs)
-
-        return slaterUp + slaterDown + CYJastrow
-
-def uhfInitialization(r_ws, spins, numkPoints, seed=558):
-    """
-    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
-    `numkPoints` specifies the number of k-points to use in the planewave
-    basis for UHF.
-
-    Returns the k-points used in the planewave basis and the UHF ground state
-    coefficients for both spin-up and spin-down electrons.
-
-    The coefficient matrices are of shape (K,N) where K is the number of
-    planewaves and N is the number of particles of each spin.
-    """
-    
-    np.random.seed(seed)
-    
-    system = qc.ueg_qc(r_ws, spins, numkPoints=numkPoints)
-    kpoints = system.get_k_points()
-    numkPoints = kpoints.shape[0]
-    h1 = system.get_h1_real(kpoints)
-    eri = system.get_eri_tensor_real(kpoints)
-    
-    mol = gto.M(verbose=0)
-    mol.nelectron = system.n_particles
-    mol.incore_anyway = True
-    mol.energy_nuc = lambda *args: 0.0
-    
-    umf = scf.UHF(mol)
-    umf.max_cycle = 200
-    umf.get_hcore = lambda *args: [h1, h1]
-    umf.get_ovlp = lambda *args: np.eye(numkPoints)
-    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
-    
-    dm0 = umf.get_init_guess()
-    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
-    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
-    umf.level_shift = 0.4
-
-    umf.kernel(dm0)
-    
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    umf.stability(external=False)
-
-    energy = umf.e_tot
-    kpoints = jnp.array(kpoints)
-    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
-    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
-
-    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
-
-class LogUHFSlaters(Wavefunction):
-    """
-    Creates a log-wavefunction that is the product of two unrestricted Slater
-    determinants where the orbitals are sums of `numKpoints` planewaves.
-
-    The `coeff` parameters contain the coefficients for this sum of planewaves,
-    and it remains FIXED since they are not added as model parameters.
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpCoeff : jnp.ndarray
-    spinDownCoeff : jnp.ndarray
-
-    def __call__(self, rs):
-        
-        def makeSimpleSlaterRow(ri):
-            def localKpointFunction(k):
-                sign = jnp.sign(
-                    1000. * jnp.sign(k[0]) +
-                    100. * jnp.sign(k[1]) +
-                    10. * jnp.sign(k[2]) +
-                    1.
-                )
-                cosSwitch = (sign + 1.) / 2. * jnp.cos(jnp.dot(k, ri))
-                sinSwitch = (1. - sign) / 2. * jnp.sin(jnp.dot(-k, ri))
-                return cosSwitch + sinSwitch
-            return jax.vmap(localKpointFunction)(self.kpoints)
-            
-        upMatrix = jax.vmap(makeSimpleSlaterRow)(rs[:self.spins[0],:])
-        downMatrix = jax.vmap(makeSimpleSlaterRow)(rs[self.spins[0]:,:])
-
-        upSlater = jnp.linalg.slogdet(upMatrix @ self.spinUpCoeff)[1]
-        downSlater = jnp.linalg.slogdet(downMatrix @ self.spinDownCoeff)[1]
-        
-        return upSlater + downSlater
-
-class LogUMPSlaters(Wavefunction):
-    """
-    Creates a log-wavefunction that is the product of two unrestricted Slater
-    determinants where the orbitals are sums of `numKpoints` planewaves.
-
-    The `coeff` parameters contain the coefficients for this sum of planewaves,
-    and they will be optimized by any downstream optimizer, since they are
-    added as parameters to the wavefunction.
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpInit : jnp.ndarray
-    spinDownInit : jnp.ndarray
-
-    def setup(self):
-
-        N = self.spins[0] + self.spins[1]
-        n = N / (self.L**3.)
-
-        self.spinUpCoeff = self.param(
-            "spinUpCoeff",
-            lambda rng: self.spinUpInit
-        )
-        self.spinDownCoeff = self.param(
-            "spinDownCoeff",
-            lambda rng: self.spinDownInit
-        )
-
-    def __call__(self, rs):
-        
-        def makeSimpleSlaterRow(ri):
-            def localKpointFunction(k):
-                sign = jnp.sign(
-                    1000. * jnp.sign(k[0]) +
-                    100. * jnp.sign(k[1]) +
-                    10. * jnp.sign(k[2]) +
-                    1.
-                )
-                cosSwitch = (sign + 1.) / 2. * jnp.cos(jnp.dot(k, ri))
-                sinSwitch = (1. - sign) / 2. * jnp.sin(jnp.dot(-k, ri))
-                return cosSwitch + sinSwitch
-            return jax.vmap(localKpointFunction)(self.kpoints)
-            
-        upMatrix = jax.vmap(makeSimpleSlaterRow)(rs[:self.spins[0],:])
-        downMatrix = jax.vmap(makeSimpleSlaterRow)(rs[self.spins[0]:,:])
-
-        upSlater = jnp.linalg.slogdet(upMatrix @ self.spinUpCoeff)[1]
-        downSlater = jnp.linalg.slogdet(downMatrix @ self.spinDownCoeff)[1]
-        
-        return upSlater + downSlater
-    
-class LogUHFCY(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: UHF solution (fixed)
-    - Jastrow: Coulomb-Yukawa
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpInit : jnp.ndarray
-    spinDownInit : jnp.ndarray
-
-    def setup(self):
-        self.slater = LogUHFSlaters(
-            self.spins, self.L,
-            self.kpoints, self.spinUpInit, self.spinDownInit
-        )
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        slater = self.slater(rs)
-        CYJastrow = self.CYJastrow(rs)
-        return slater + CYJastrow
-    
-class LogUMPCY(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: unrestricted sum of multiple planewaves
-    - Jastrow: Coulomb-Yukawa
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpInit : jnp.ndarray
-    spinDownInit : jnp.ndarray
-
-    def setup(self):
-        self.slater = LogUMPSlaters(
-            self.spins, self.L,
-            self.kpoints, self.spinUpInit, self.spinDownInit
-        )
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        slater = self.slater(rs)
-        CYJastrow = self.CYJastrow(rs)
-        return slater + CYJastrow
         
 class DecayFunction():
     """
@@ -848,140 +524,6 @@ class LogThreePavanJastrowRHF(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
 
-class LogMessagePassingJastrow(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: RHF ground state
-    - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
-
-    TODO:
-    - richer v_ij (e.g., with sines and magnitude)
-      - but make sure cusp conditions are maintained!
-    """
-    spins : (int,int)
-    L : float
-    T : int
-    hiddenFeatures : int
-    d1 : int
-    d2 : int
-    dv : int
-
-    def setup(self):
-        
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-        
-        self.decay = DecayFunction(self.L)
-
-        self.hi0 = self.param(
-            "hi0",
-            lambda rng : jnp.zeros(self.d1)
-        )
-        self.hij0 = self.param(
-            "hij0",
-            lambda rng : jnp.zeros(self.d2)
-        )
-
-        self.Wqt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
-        self.Wkt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
-
-        self.Fmt = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2 + self.dv)
-            ) for _ in range(self.T)
-        ]
-
-        self.Alineart = [
-            nn.Dense(self.d2 + self.dv) for _ in range(self.T)
-        ]
-
-        self.F1t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d1)
-            ) for _ in range(self.T)
-        ]
-        self.F2t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2)
-            ) for _ in range(self.T)
-        ]
-        
-        self.FJt = (
-            nn.Dense(self.hiddenFeatures),
-            nn.Dense(1)
-        )
-
-    def __call__(self, rs):
-        
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
-        CYJastrow = self.CYJastrow(rs)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
-        decays = jnp.where(mask, decays, 0.0)
-        
-        cusplessDisps = jnp.cos(jnp.pi * disps / self.L)
-
-        N = self.spins[0] + self.spins[1]
-        electronIdxs = jnp.arange(N)
-        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
-        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
-
-        vij = jnp.concatenate([cusplessDisps, matchMatrix], axis=-1)
-
-        hit = jnp.broadcast_to(self.hi0, (N,self.d1))
-        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2))
-
-        for t in range(self.T):
-
-            git = hit
-            gijt = jnp.concatenate([hijt,vij], axis=-1)
-
-            qijt = self.Wqt[t](gijt) * decays
-            kijt = self.Wkt[t](gijt) * decays
-            
-            """
-            # Numpy reference implementation
-            np_Aijt = np.zeros((N,N,self.d2+self.dv))
-            for i in range(N):
-                for j in range(N):
-                    for l in range(N):
-                        np_Aijt[i,j,:] += qijt[i,l,:] * kijt[l,j,:] / jnp.sqrt(N)
-            """
-
-            Aijt = self.Alineart[t](
-                nn.swish(
-                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
-                )
-            )
-
-            mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
-            acc_mijt = jnp.sum(mijt * decays, axis=1)
-            
-            hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
-                jnp.concatenate([acc_mijt,git], axis=-1)
-            )))
-            hijt += self.F2t[t][1](nn.swish(self.F2t[t][0](
-                jnp.concatenate([mijt, gijt], axis=-1)
-            )))
-
-        MPJastrow = jnp.sum(self.FJt[1](nn.swish(self.FJt[0](hit))))
-        
-        return slaterUp + slaterDown + CYJastrow + MPJastrow
-
 class LogMessagePassingSJB(Wavefunction):
     """
     Slater-Jastrow wavefunction with following specs:
@@ -1050,10 +592,7 @@ class LogMessagePassingSJB(Wavefunction):
             nn.Dense(self.hiddenFeatures),
             nn.Dense(1)
         )
-        self.FBFt = (
-            nn.Dense(self.hiddenFeatures),
-            nn.Dense(3)
-        )
+        self.FBFt = nn.Dense(3)
 
     def __call__(self, rs):
         
@@ -1067,9 +606,12 @@ class LogMessagePassingSJB(Wavefunction):
         decays = self.decay(r_ij)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
 
-        cosDisps = jnp.cos(jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(jnp.pi * disps / self.L)
-        sinDispsMag = jnp.linalg.norm(sinDisps, axis=-1, keepdims=True)
+        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
+        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
+        sinDispsMag = jnp.linalg.norm(
+            jnp.sin(jnp.pi * disps / self.L),
+            axis=-1, keepdims=True
+        )
         sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
         
         N = self.spins[0] + self.spins[1]
@@ -1089,7 +631,7 @@ class LogMessagePassingSJB(Wavefunction):
 
             git = hit
             gijt = jnp.concatenate([hijt,vij], axis=-1)
-
+            
             qijt = self.Wqt[t](gijt) * decays
             kijt = self.Wkt[t](gijt) * decays
             
@@ -1099,12 +641,12 @@ class LogMessagePassingSJB(Wavefunction):
             for i in range(N):
                 for j in range(N):
                     for l in range(N):
-                        np_Aijt[i,j,:] += qijt[i,l,:] * kijt[l,j,:] / jnp.sqrt(N)
+                        np_Aijt[i,j,:] += qijt[i,l,:] * kijt[l,j,:] # / jnp.sqrt(N)
             """
 
             Aijt = self.Alineart[t](
                 nn.swish(
-                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
+                    jnp.einsum("ild,ljd->ijd", qijt, kijt) # / jnp.sqrt(N)
                 )
             )
 
@@ -1118,8 +660,11 @@ class LogMessagePassingSJB(Wavefunction):
                 jnp.concatenate([mijt, gijt], axis=-1)
             )))
 
-        MPJastrow = jnp.sum(self.FJt[1](nn.swish(self.FJt[0](hit))))
-        MPBackflow = self.FBFt[1](nn.swish(self.FBFt[0](hit)))
+        git = hit
+        gijt = jnp.concatenate([hijt,vij], axis=-1)
+
+        MPJastrow = jnp.sum(self.FJt[1](nn.swish(self.FJt[0](git))))
+        MPBackflow = self.FBFt(git)
 
         xs = rs + MPBackflow
         
@@ -1127,3 +672,192 @@ class LogMessagePassingSJB(Wavefunction):
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
         
         return slaterUp + slaterDown + CYJastrow + MPJastrow
+
+def uhfInitialization(r_ws, spins, numkPoints, seed=558):
+    """
+    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
+    `numkPoints` specifies the number of k-points to use in the planewave
+    basis for UHF.
+
+    Returns the k-points used in the planewave basis and the UHF ground state
+    coefficients for both spin-up and spin-down electrons.
+
+    The coefficient matrices are of shape (K,N) where K is the number of
+    planewaves and N is the number of particles of each spin.
+    """
+    
+    np.random.seed(seed)
+    
+    system = qc.ueg_qc(r_ws, spins, numkPoints=numkPoints)
+    kpoints = system.get_k_points()
+    numkPoints = kpoints.shape[0]
+    h1 = system.get_h1_real(kpoints)
+    eri = system.get_eri_tensor_real(kpoints)
+    
+    mol = gto.M(verbose=0)
+    mol.nelectron = system.n_particles
+    mol.incore_anyway = True
+    mol.energy_nuc = lambda *args: 0.0
+    
+    umf = scf.UHF(mol)
+    umf.max_cycle = 200
+    umf.get_hcore = lambda *args: [h1, h1]
+    umf.get_ovlp = lambda *args: np.eye(numkPoints)
+    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
+    
+    dm0 = umf.get_init_guess()
+    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
+    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
+    umf.level_shift = 0.4
+
+    umf.kernel(dm0)
+    
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    umf.stability(external=False)
+
+    energy = umf.e_tot
+    kpoints = jnp.array(kpoints)
+    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
+    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
+
+    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
+
+class LogUHFSlaters(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two unrestricted Slater
+    determinants where the orbitals are sums of `numKpoints` planewaves.
+
+    The `coeff` parameters contain the coefficients for this sum of planewaves,
+    and it remains FIXED since they are not added as model parameters.
+    """
+    spins : (int,int)
+    L : float
+    kpoints : jnp.ndarray
+    spinUpCoeff : jnp.ndarray
+    spinDownCoeff : jnp.ndarray
+
+    def __call__(self, rs):
+        
+        def makeSimpleSlaterRow(ri):
+            def localKpointFunction(k):
+                sign = jnp.sign(
+                    1000. * jnp.sign(k[0]) +
+                    100. * jnp.sign(k[1]) +
+                    10. * jnp.sign(k[2]) +
+                    1.
+                )
+                cosSwitch = (sign + 1.) / 2. * jnp.cos(jnp.dot(k, ri))
+                sinSwitch = (1. - sign) / 2. * jnp.sin(jnp.dot(-k, ri))
+                return cosSwitch + sinSwitch
+            return jax.vmap(localKpointFunction)(self.kpoints)
+            
+        upMatrix = jax.vmap(makeSimpleSlaterRow)(rs[:self.spins[0],:])
+        downMatrix = jax.vmap(makeSimpleSlaterRow)(rs[self.spins[0]:,:])
+
+        upSlater = jnp.linalg.slogdet(upMatrix @ self.spinUpCoeff)[1]
+        downSlater = jnp.linalg.slogdet(downMatrix @ self.spinDownCoeff)[1]
+        
+        return upSlater + downSlater
+
+class LogUMPSlaters(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two unrestricted Slater
+    determinants where the orbitals are sums of `numKpoints` planewaves.
+
+    The `coeff` parameters contain the coefficients for this sum of planewaves,
+    and they will be optimized by any downstream optimizer, since they are
+    added as parameters to the wavefunction.
+    """
+    spins : (int,int)
+    L : float
+    kpoints : jnp.ndarray
+    spinUpInit : jnp.ndarray
+    spinDownInit : jnp.ndarray
+
+    def setup(self):
+
+        N = self.spins[0] + self.spins[1]
+        n = N / (self.L**3.)
+
+        self.spinUpCoeff = self.param(
+            "spinUpCoeff",
+            lambda rng: self.spinUpInit
+        )
+        self.spinDownCoeff = self.param(
+            "spinDownCoeff",
+            lambda rng: self.spinDownInit
+        )
+
+    def __call__(self, rs):
+        
+        def makeSimpleSlaterRow(ri):
+            def localKpointFunction(k):
+                sign = jnp.sign(
+                    1000. * jnp.sign(k[0]) +
+                    100. * jnp.sign(k[1]) +
+                    10. * jnp.sign(k[2]) +
+                    1.
+                )
+                cosSwitch = (sign + 1.) / 2. * jnp.cos(jnp.dot(k, ri))
+                sinSwitch = (1. - sign) / 2. * jnp.sin(jnp.dot(-k, ri))
+                return cosSwitch + sinSwitch
+            return jax.vmap(localKpointFunction)(self.kpoints)
+            
+        upMatrix = jax.vmap(makeSimpleSlaterRow)(rs[:self.spins[0],:])
+        downMatrix = jax.vmap(makeSimpleSlaterRow)(rs[self.spins[0]:,:])
+
+        upSlater = jnp.linalg.slogdet(upMatrix @ self.spinUpCoeff)[1]
+        downSlater = jnp.linalg.slogdet(downMatrix @ self.spinDownCoeff)[1]
+        
+        return upSlater + downSlater
+    
+class LogUHFCY(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: UHF solution (fixed)
+    - Jastrow: Coulomb-Yukawa
+    """
+    spins : (int,int)
+    L : float
+    kpoints : jnp.ndarray
+    spinUpInit : jnp.ndarray
+    spinDownInit : jnp.ndarray
+
+    def setup(self):
+        self.slater = LogUHFSlaters(
+            self.spins, self.L,
+            self.kpoints, self.spinUpInit, self.spinDownInit
+        )
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+
+    def __call__(self, rs):
+        slater = self.slater(rs)
+        CYJastrow = self.CYJastrow(rs)
+        return slater + CYJastrow
+    
+class LogUMPCY(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: unrestricted sum of multiple planewaves
+    - Jastrow: Coulomb-Yukawa
+    """
+    spins : (int,int)
+    L : float
+    kpoints : jnp.ndarray
+    spinUpInit : jnp.ndarray
+    spinDownInit : jnp.ndarray
+
+    def setup(self):
+        self.slater = LogUMPSlaters(
+            self.spins, self.L,
+            self.kpoints, self.spinUpInit, self.spinDownInit
+        )
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+
+    def __call__(self, rs):
+        slater = self.slater(rs)
+        CYJastrow = self.CYJastrow(rs)
+        return slater + CYJastrow
