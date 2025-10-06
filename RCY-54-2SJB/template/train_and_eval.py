@@ -23,7 +23,7 @@ start = time.time()
 #   Settings for whole simulation                                             #
 ###############################################################################
 
-r_ws = 5
+r_ws = xxxRSxxx
 N = 54
 tau = 1.25
 
@@ -53,7 +53,7 @@ diagonalShift = 1e-4
 if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
-    hyperparameters[0] = optimization.logSample(1e-4,5e2)
+    hyperparameters[0] = optimization.logSample(xxxLRMIN0xxx,xxxLRMAX0xxx)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
@@ -66,7 +66,7 @@ print("HYPERPARAMETERS: " + str(hyperparameters))
 ###############################################################################
 
 #wavefunction = wavefunctions.LogSlaterCYJastrow(spins, L)
-wavefunction = wavefunctions.LogTwoBodySJ(spins, L, 16)
+wavefunction = wavefunctions.LogTwoBodySJB(spins, L, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
 optimizer = optimization.StochasticReconfiguration(wavefunction, localEnergy)

@@ -32,7 +32,7 @@ walkers = 1024
 eqSteps      = 2000
 trainSteps   = 2000
 trainEqSteps = 20
-evalSteps    = 10000
+evalSteps    = 2000
 
 NUp = N // 2
 NDown = N - NUp
