@@ -877,25 +877,25 @@ class LogMessagePassingSJB(Wavefunction):
             """
 
             Aijt = self.Alineart[t](
-                nn.swish(
-                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / N
+                nn.gelu(
+                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
                 )
             )
 
-            mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
+            mijt = Aijt * self.Fmt[t][1](nn.gelu(self.Fmt[t][0](gijt)))
             acc_mijt = jnp.average(mijt * decays, axis=1)
             
-            hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
+            hit += self.F1t[t][1](nn.gelu(self.F1t[t][0](
                 jnp.concatenate([acc_mijt,git], axis=-1)
             )))
-            hijt += self.F2t[t][1](nn.swish(self.F2t[t][0](
+            hijt += self.F2t[t][1](nn.gelu(self.F2t[t][0](
                 jnp.concatenate([mijt, gijt], axis=-1)
             )))
 
         git = hit
         gijt = jnp.concatenate([hijt,vij], axis=-1)
 
-        MPJastrow = jnp.average(self.FJt[1](nn.swish(self.FJt[0](git))))
+        MPJastrow = jnp.average(self.FJt[1](nn.gelu(self.FJt[0](git))))
         MPBackflow = self.FBFt(git)
 
         xs = rs + MPBackflow
