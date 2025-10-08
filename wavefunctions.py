@@ -253,21 +253,28 @@ class LogSlaterCYJastrow(Wavefunction):
         
 class DecayFunction():
     """
-    Takes in a list of distances and computes the (cuspless) bump decay
-    function.
+    Takes in a list of wrapped displacements and computes the (cuspless) bump
+    decay function. This decay function uses cubic decays, rather than
+    spherical decays. This means that the Jastrow dies at the unit cell
+    boundaries, rather than at a spherical distance of L/2.
+
+    The important thing is that the displacements have the physical dimension
+    of the system as the last axis.
 
     This is useful in computing Jastrows, since we want the effect of the
-    Jastrow to die down before r_ij = L/2 so that the Jastrow remains smooth
-    everywhere (except at the cusps ofc).
+    Jastrow to die down at the unit cell boundaries so that the Jastrow remains
+    smooth everywhere (except at the cusps ofc).
     """
 
     def __init__(self, L):
         self.L = L
     
-    def __call__(self, dists):
+    def __call__(self, disps):
         r_cut = self.L / 2
-        xs = jnp.clip(dists / r_cut, a_min=0.0, a_max=0.99999)
-        decay = jnp.exp(1 - 1 / (1 - xs**2))
+        x = jnp.abs(disps) / r_cut
+        bump = jnp.exp(1 - 1 / (1 - x**32))
+        wrap_bump = jnp.where(x < 1.0, bump, 0.0)
+        decay = jnp.prod(wrap_bump, axis=-1)
         return decay
 
 class LogTwoBodySJ(Wavefunction):
@@ -303,7 +310,7 @@ class LogTwoBodySJ(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
         r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
+        decays = self.decay(disps)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
 
         cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
@@ -349,104 +356,6 @@ class LogTwoBodySJB(Wavefunction):
         self.CYJastrow = LogCYJastrow(self.spins, self.L)
         
         self.decay = DecayFunction(self.L)
-        
-        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
-        self.neuralJastrow2 = nn.Dense(1)
-        
-        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
-        self.neuralBackflow2 = nn.Dense(3)
-
-    def __call__(self, rs):
-        
-        CYJastrow = self.CYJastrow(rs)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
-        decays = jnp.where(mask, decays, 0.0)
-
-        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
-        sinDispsMag = jnp.linalg.norm(
-            jnp.sin(jnp.pi * disps / self.L),
-            axis=-1, keepdims=True
-        )
-        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
-        
-        N = self.spins[0] + self.spins[1]
-        electronIdxs = jnp.arange(N)
-        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
-        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
-        
-        v_ij = jnp.concatenate(
-            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
-            axis=-1
-        )
-        
-        selfTerm = decays * self.neuralJastrow2(nn.swish(
-            self.neuralJastrow1(v_ij)
-        ))
-        neuralJastrow = jnp.average(selfTerm)
-
-        backflow = jnp.average(
-            decays * self.neuralBackflow2(nn.swish(
-                self.neuralBackflow1(v_ij)
-            )), axis=1
-        )
-        xs = rs + backflow
-        
-        slaterUp = self.slaterUp(xs[:self.spins[0],:])
-        slaterDown = self.slaterDown(xs[self.spins[0]:,:])
-        
-        return slaterUp + slaterDown + CYJastrow + neuralJastrow
-        
-class DecayFunctionStretch():
-    """
-    Takes in a list of wrapped displacements and computes the (cuspless) bump
-    decay function.
-
-    This is useful in computing Jastrows, since we want the effect of the
-    Jastrow to die down at the unit cell boundaries so that the Jastrow remains
-    smooth everywhere (except at the cusps ofc).
-    """
-
-    def __init__(self, L):
-        self.L = L
-    
-    def __call__(self, disps):
-        r_cut = self.L / 2
-        x = jnp.abs(disps) / r_cut
-        bump = jnp.exp(1 - 1 / (1 - x**2))
-        bump = jnp.exp(1 - 1 / (1 - x**8))
-        wrap_bump = jnp.where(x < 1.0, bump, 0.0)
-        decay = jnp.prod(wrap_bump, axis=-1)
-        return decay
-
-class LogTwoBodySJBStretch(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: RHF ground state
-    - Jastrow: Coulomb-Yukawa + neural function acting on pairwise information
-        NOTE: This basically comes up with the "best" two-body Jastrow.
-    - Backflow: acts purely on pairwise information to produce arbitrary
-                backflow coordinates
-
-    This function is different becauses it uses a different decay function...
-    """
-    spins : (int,int)
-    L : float
-    hiddenFeatures : int
-
-    def setup(self):
-        
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-        
-        self.decay = DecayFunctionStretch(self.L)
         
         self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
         self.neuralJastrow2 = nn.Dense(1)
@@ -537,7 +446,7 @@ class LogThreeCeperleyJastrowRHF(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
         r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
+        decays = self.decay(disps)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
         
         cusplessDisps = jnp.cos(jnp.pi * disps / self.L)
@@ -627,7 +536,7 @@ class LogThreePavanJastrowRHF(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
         r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
+        decays = self.decay(disps)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
         
         cusplessDisps = jnp.cos(jnp.pi * disps / self.L)
@@ -704,155 +613,6 @@ class LogThreePavanJastrowRHF(Wavefunction):
         MBJastrow = jnp.sum(selfTerm) + U3
         
         return slaterUp + slaterDown + CYJastrow + MBJastrow
-
-class LogPavanSJB(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: RHF ground state
-    - Jastrow: Coulomb-Yukawa + attempt at 3-body Jastrow
-    - Backflow: pairwise + attempt at 3-body Jastrow
-
-    """
-    spins : (int,int)
-    L : float
-    T : int
-    hiddenFeatures : int
-    d1 : int
-    d2 : int
-    dv : int
-
-    def setup(self):
-        
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-        
-        self.decay = DecayFunction(self.L)
-
-        self.hi0 = self.param(
-            "hi0",
-            lambda rng : jnp.zeros(self.d1)
-        )
-        self.hij0 = self.param(
-            "hij0",
-            lambda rng : jnp.zeros(self.d2)
-        )
-
-        self.Wqt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
-        self.Wkt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
-
-        self.Fmt = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2 + self.dv)
-            ) for _ in range(self.T)
-        ]
-
-        self.Alineart = [
-            nn.Dense(self.d2 + self.dv) for _ in range(self.T)
-        ]
-
-        self.F1t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d1)
-            ) for _ in range(self.T)
-        ]
-        self.F2t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2)
-            ) for _ in range(self.T)
-        ]
-        
-        self.FJt = (
-            nn.Dense(self.hiddenFeatures),
-            nn.Dense(1)
-        )
-        self.FBFt = nn.Dense(3)
-
-    def __call__(self, rs):
-        
-        CYJastrow = self.CYJastrow(rs)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
-        decays = jnp.where(mask, decays, 0.0)
-
-        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
-        sinDispsMag = jnp.linalg.norm(
-            jnp.sin(jnp.pi * disps / self.L),
-            axis=-1, keepdims=True
-        )
-        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
-        
-        N = self.spins[0] + self.spins[1]
-        electronIdxs = jnp.arange(N)
-        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
-        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
-        
-        vij = jnp.concatenate(
-            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
-            axis=-1
-        )
-
-        hit = jnp.broadcast_to(self.hi0, (N,self.d1))
-        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2))
-
-        for t in range(self.T):
-
-            git = hit
-            gijt = jnp.concatenate([hijt,vij], axis=-1)
-            
-            qijt = self.Wqt[t](gijt) * decays
-            kijt = self.Wkt[t](gijt) * decays
-            
-            """
-            # Numpy reference implementation
-            np_Aijt = np.zeros((N,N,self.d2+self.dv))
-            for i in range(N):
-                for j in range(N):
-                    for l in range(N):
-                        np_Aijt[i,j,:] += qijt[i,l,:] * kijt[l,j,:] # / jnp.sqrt(N)
-            """
-
-            Aijt = self.Alineart[t](
-                nn.swish(
-                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / N
-                )
-            )
-
-            mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
-            acc_mijt = jnp.average(mijt * decays, axis=1)
-            
-            hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
-                jnp.concatenate([acc_mijt,git], axis=-1)
-            )))
-            hijt += self.F2t[t][1](nn.swish(self.F2t[t][0](
-                jnp.concatenate([mijt, gijt], axis=-1)
-            )))
-
-        git = hit
-        gijt = jnp.concatenate([hijt,vij], axis=-1)
-
-        MPJastrow = jnp.average(self.FJt[1](nn.swish(self.FJt[0](git))))
-        MPBackflow = self.FBFt(git)
-
-        xs = rs + MPBackflow
-        
-        slaterUp = self.slaterUp(xs[:self.spins[0],:])
-        slaterDown = self.slaterDown(xs[self.spins[0]:,:])
-        
-        return slaterUp + slaterDown + CYJastrow + MPJastrow
 
 class LogMessagePassingSJB(Wavefunction):
     """
@@ -933,7 +693,7 @@ class LogMessagePassingSJB(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
         r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
+        decays = self.decay(disps)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
 
         cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
