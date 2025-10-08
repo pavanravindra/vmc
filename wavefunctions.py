@@ -418,10 +418,10 @@ class DecayFunctionStretch():
     
     def __call__(self, disps):
         r_cut = self.L / 2
-        scale = jnp.max(jnp.abs(disps), axis=1, keepdims=True)
+        scale = jnp.max(jnp.abs(disps), axis=-1, keepdims=True)
         vectorCut = disps * r_cut / scale
-        normCuts = jnp.linalg.norm(vectorCut, axis=1)
-        dists = jnp.linalg.norm(disps, axis=1)
+        normCuts = jnp.linalg.norm(vectorCut, axis=-1)
+        dists = jnp.linalg.norm(disps, axis=-1)
         xs = jnp.clip(dists / normCuts, a_min=0.0, a_max=0.99999)
         decay = jnp.exp(1 - 1 / (1 - xs**8))
         return decay
