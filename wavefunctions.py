@@ -418,74 +418,12 @@ class DecayFunctionStretch():
     
     def __call__(self, disps):
         r_cut = self.L / 2
-        scale = jnp.max(jnp.abs(disps), axis=-1, keepdims=True)
-        vectorCut = disps * r_cut / scale
-        normCuts = jnp.linalg.norm(vectorCut, axis=-1)
-        dists = jnp.linalg.norm(disps, axis=-1)
-        xs = jnp.clip(dists / normCuts, a_min=0.0, a_max=0.99999)
-        decay = jnp.exp(1 - 1 / (1 - xs**8))
+        x = jnp.abs(disps) / r_cut
+        bump = jnp.exp(1 - 1 / (1 - x**2))
+        bump = jnp.exp(1 - 1 / (1 - x**8))
+        wrap_bump = jnp.where(x < 1.0, bump, 0.0)
+        decay = jnp.prod(wrap_bump, axis=-1)
         return decay
-
-def coulombYukawaStretch(r, A, F, L):
-    """
-    Coulomb-Yukawa two-body Jastrow function. Also has a decay term so that the
-    Jastrow appropriately dies off before the boundary.
-
-    """
-    cy = (A/r) * (1 - jnp.exp(-r/F))
-    r_cut = L/2
-    x = jnp.clip(r / r_cut, a_min=0.0, a_max=1.0-1e-5)
-    decay = jnp.exp(1 - 1 / (1 - x**8))
-    return cy * decay
-
-class LogCYJastrowStretch(Wavefunction):
-    """
-    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
-    and different spin electrons are handled by different $A$ parameters.
-    Hence, this wavefunction has two variational parameters.
-
-    The conventional $F$ parameters are set by the cusp conditions.
-
-    NOTE: In this implementation, we always take the absolute values of the $A$
-    parameters. This is so that even if negative values are encountered during
-    optimization, the resulting wavefunction remains physical.
-    """
-    spins : (int,int)
-    L : float
-
-    def setup(self):
-
-        N = self.spins[0] + self.spins[1]
-        n = N / (self.L**3.)
-
-        self.As = self.param(
-            "As_same_diff",
-            lambda rng : jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
-        )
-
-    def __call__(self, rs):
-
-        A_same = jnp.abs(self.As[0])
-        A_diff = jnp.abs(self.As[1])
-        
-        F_same = jnp.sqrt(2 * A_same)
-        F_diff = jnp.sqrt(A_diff)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
-
-        same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
-        same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
-        sameDists = jnp.concatenate([same_up, same_down])
-        sameCY = coulombYukawaStretch(sameDists, A_same, F_same, self.L)
-        
-        diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
-        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
-
-        return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
 
 class LogTwoBodySJBStretch(Wavefunction):
     """
@@ -506,7 +444,7 @@ class LogTwoBodySJBStretch(Wavefunction):
         
         self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrowStretch(self.spins, self.L)
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
         
         self.decay = DecayFunctionStretch(self.L)
         
