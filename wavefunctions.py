@@ -402,6 +402,162 @@ class LogTwoBodySJB(Wavefunction):
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
+        
+class DecayFunctionStretch():
+    """
+    Takes in a list of distances and computes the (cuspless) bump decay
+    function.
+
+    This is useful in computing Jastrows, since we want the effect of the
+    Jastrow to die down before r_ij = L/2 so that the Jastrow remains smooth
+    everywhere (except at the cusps ofc).
+    """
+
+    def __init__(self, L):
+        self.L = L
+    
+    def __call__(self, dists):
+        r_cut = self.L / 2
+        xs = jnp.clip(dists / r_cut, a_min=0.0, a_max=0.99999)
+        decay = jnp.exp(1 - 1 / (1 - xs**8))
+        return decay
+
+def coulombYukawaStretch(r, A, F, L):
+    """
+    Coulomb-Yukawa two-body Jastrow function. Also has a decay term so that the
+    Jastrow appropriately dies off before the boundary.
+
+    """
+    cy = (A/r) * (1 - jnp.exp(-r/F))
+    r_cut = L/2
+    x = jnp.clip(r / r_cut, a_min=0.0, a_max=1.0-1e-5)
+    decay = jnp.exp(1 - 1 / (1 - x**8))
+    return cy * decay
+
+class LogCYJastrowStretch(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
+    and different spin electrons are handled by different $A$ parameters.
+    Hence, this wavefunction has two variational parameters.
+
+    The conventional $F$ parameters are set by the cusp conditions.
+
+    NOTE: In this implementation, we always take the absolute values of the $A$
+    parameters. This is so that even if negative values are encountered during
+    optimization, the resulting wavefunction remains physical.
+    """
+    spins : (int,int)
+    L : float
+
+    def setup(self):
+
+        N = self.spins[0] + self.spins[1]
+        n = N / (self.L**3.)
+
+        self.As = self.param(
+            "As_same_diff",
+            lambda rng : jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
+        )
+
+    def __call__(self, rs):
+
+        A_same = jnp.abs(self.As[0])
+        A_diff = jnp.abs(self.As[1])
+        
+        F_same = jnp.sqrt(2 * A_same)
+        F_diff = jnp.sqrt(A_diff)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        disps = (disps + self.L/2) % self.L - self.L/2
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+        r_ij = jnp.linalg.norm(disps, axis=-1)
+
+        same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
+        same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
+        sameDists = jnp.concatenate([same_up, same_down])
+        sameCY = coulombYukawaStretch(sameDists, A_same, F_same, self.L)
+        
+        diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
+        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
+
+        return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
+
+class LogTwoBodySJBStretch(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: RHF ground state
+    - Jastrow: Coulomb-Yukawa + neural function acting on pairwise information
+        NOTE: This basically comes up with the "best" two-body Jastrow.
+    - Backflow: acts purely on pairwise information to produce arbitrary
+                backflow coordinates
+
+    This function is different becauses it uses a slower decay function...
+    """
+    spins : (int,int)
+    L : float
+    hiddenFeatures : int
+
+    def setup(self):
+        
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
+        self.CYJastrow = LogCYJastrowStretch(self.spins, self.L)
+        
+        self.decay = DecayFunctionStretch(self.L)
+        
+        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralJastrow2 = nn.Dense(1)
+        
+        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralBackflow2 = nn.Dense(3)
+
+    def __call__(self, rs):
+        
+        CYJastrow = self.CYJastrow(rs)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        disps = (disps + self.L/2) % self.L - self.L/2
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+        r_ij = jnp.linalg.norm(disps, axis=-1)
+        decays = self.decay(r_ij)[:,:,None]
+        decays = jnp.where(mask, decays, 0.0)
+
+        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
+        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
+        sinDispsMag = jnp.linalg.norm(
+            jnp.sin(jnp.pi * disps / self.L),
+            axis=-1, keepdims=True
+        )
+        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
+        
+        N = self.spins[0] + self.spins[1]
+        electronIdxs = jnp.arange(N)
+        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
+        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
+        
+        v_ij = jnp.concatenate(
+            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
+            axis=-1
+        )
+        
+        selfTerm = decays * self.neuralJastrow2(nn.swish(
+            self.neuralJastrow1(v_ij)
+        ))
+        neuralJastrow = jnp.average(selfTerm)
+
+        backflow = jnp.average(
+            decays * self.neuralBackflow2(nn.swish(
+                self.neuralBackflow1(v_ij)
+            )), axis=1
+        )
+        xs = rs + backflow
+        
+        slaterUp = self.slaterUp(xs[:self.spins[0],:])
+        slaterDown = self.slaterDown(xs[self.spins[0]:,:])
+        
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
 class LogThreeCeperleyJastrowRHF(Wavefunction):
     """
