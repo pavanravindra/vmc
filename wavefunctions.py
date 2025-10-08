@@ -405,20 +405,24 @@ class LogTwoBodySJB(Wavefunction):
         
 class DecayFunctionStretch():
     """
-    Takes in a list of distances and computes the (cuspless) bump decay
-    function.
+    Takes in a list of wrapped displacements and computes the (cuspless) bump
+    decay function.
 
     This is useful in computing Jastrows, since we want the effect of the
-    Jastrow to die down before r_ij = L/2 so that the Jastrow remains smooth
-    everywhere (except at the cusps ofc).
+    Jastrow to die down at the unit cell boundaries so that the Jastrow remains
+    smooth everywhere (except at the cusps ofc).
     """
 
     def __init__(self, L):
         self.L = L
     
-    def __call__(self, dists):
+    def __call__(self, disps):
         r_cut = self.L / 2
-        xs = jnp.clip(dists / r_cut, a_min=0.0, a_max=0.99999)
+        scale = jnp.max(jnp.abs(disps), axis=1, keepdims=True)
+        vectorCut = disps * r_cut / scale
+        normCuts = jnp.linalg.norm(vectorCut, axis=1)
+        dists = jnp.linalg.norm(disps, axis=1)
+        xs = jnp.clip(dists / normCuts, a_min=0.0, a_max=0.99999)
         decay = jnp.exp(1 - 1 / (1 - xs**8))
         return decay
 
@@ -492,7 +496,7 @@ class LogTwoBodySJBStretch(Wavefunction):
     - Backflow: acts purely on pairwise information to produce arbitrary
                 backflow coordinates
 
-    This function is different becauses it uses a slower decay function...
+    This function is different becauses it uses a different decay function...
     """
     spins : (int,int)
     L : float
@@ -521,7 +525,7 @@ class LogTwoBodySJBStretch(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
         r_ij = jnp.linalg.norm(disps, axis=-1)
-        decays = self.decay(r_ij)[:,:,None]
+        decays = self.decay(disps)[:,:,None]
         decays = jnp.where(mask, decays, 0.0)
 
         cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
