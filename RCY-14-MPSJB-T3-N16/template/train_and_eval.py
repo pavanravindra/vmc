@@ -30,9 +30,9 @@ tau = 1.25
 walkers = 1024
 
 eqSteps      = 2000
-trainSteps   = 1000 # 2000
+trainSteps   = 1000
 trainEqSteps = 20
-evalSteps    = 1000 # 10000
+evalSteps    = 1000
 
 NUp = N // 2
 NDown = N - NUp
@@ -43,7 +43,7 @@ L = wavefunctions.computeL(N, r_ws)
 ( acceptMin , acceptMax ) = ( 0.55 , 0.65 )
 
 T = 1000
-diagonalShift = 1e-4
+diagonalShift = 1e-3
 
 
 ###############################################################################
@@ -65,8 +65,9 @@ print("HYPERPARAMETERS: " + str(hyperparameters))
 #   Creating wavefunction, walker updater, optimizer, and local energy        #
 ###############################################################################
 
+#wavefunction = wavefunctions.LogSlaterCYJastrow(spins, L)
 wavefunction = wavefunctions.LogMessagePassingSJB(
-    spins, L, 3, 16, 16, 9, 7
+    spins, L, 3, 16, 16, 8, 8
 )
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
@@ -182,9 +183,9 @@ for dt in range(trainSteps):
 
         rs = newRs
 
-    print("Step {:5d}   Energy: {:.5f}   Norm: {:5}   Min Acc: {:.3f}   Avg Acc: {:.3f}".format(
+    print("Step {:5d}   Energy: {:.5f}   Norm: {:5}   Min Acc: {:.3f}   Avg Acc: {:.3f}   Param Norm: {:.5f}".format(
         dt, jnp.average(currentEnergies) / N, str(maxNorm),
-        np.min(acceptArrays), np.average(acceptArrays)
+        np.min(acceptArrays), np.average(acceptArrays), np.linalg.norm(optimization.flatten(parameters))
     ))
 
 print("Finished optimization!\n")

@@ -390,6 +390,12 @@ class LogMessagePassingSJB(Wavefunction):
         self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
         self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        
+        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralJastrow2 = nn.Dense(1)
+        
+        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralBackflow2 = nn.Dense(3)
 
         self.hi0 = self.param(
             "hi0",
@@ -430,12 +436,6 @@ class LogMessagePassingSJB(Wavefunction):
                 nn.Dense(self.d2)
             ) for _ in range(self.T)
         ]
-        
-        self.FJt = (
-            nn.Dense(self.hiddenFeatures),
-            nn.Dense(1)
-        )
-        self.FBFt = nn.Dense(3)
 
     def __call__(self, rs):
         
@@ -458,19 +458,19 @@ class LogMessagePassingSJB(Wavefunction):
         electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
         matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
         
-        vij = jnp.concatenate(
+        v_ij = jnp.concatenate(
             [cosDisps, sinDisps, sinDispsMag, matchMatrix],
             axis=-1
         )
 
-        hit = jnp.broadcast_to(self.hi0, (N,self.d1))
+        #hit = jnp.broadcast_to(self.hi0, (N,self.d1))
         hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2))
 
         for t in range(self.T):
 
-            git = hit
-            gijt = jnp.concatenate([hijt,vij], axis=-1)
-            
+            #git = hit
+            gijt = jnp.concatenate([hijt,v_ij], axis=-1)
+
             qijt = self.Wqt[t](gijt)
             kijt = self.Wkt[t](gijt)
             
@@ -484,33 +484,42 @@ class LogMessagePassingSJB(Wavefunction):
             """
 
             Aijt = self.Alineart[t](
-                nn.gelu(
+                nn.swish(
                     jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
                 )
             )
 
-            mijt = Aijt * self.Fmt[t][1](nn.gelu(self.Fmt[t][0](gijt)))
-            acc_mijt = jnp.average(mijt, axis=1)
+            mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
+            #acc_mijt = jnp.average(mijt, axis=1)
             
-            hit += self.F1t[t][1](nn.gelu(self.F1t[t][0](
-                jnp.concatenate([acc_mijt,git], axis=-1)
-            )))
-            hijt += self.F2t[t][1](nn.gelu(self.F2t[t][0](
+            #hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
+            #    jnp.concatenate([acc_mijt,git], axis=-1)
+            #)))
+            hijt += self.F2t[t][1](nn.swish(self.F2t[t][0](
                 jnp.concatenate([mijt, gijt], axis=-1)
             )))
 
-        git = hit
-        gijt = jnp.concatenate([hijt,vij], axis=-1)
+        #git = hit
+        gijt = jnp.concatenate([hijt,v_ij], axis=-1)
 
-        MPJastrow = jnp.average(self.FJt[1](nn.gelu(self.FJt[0](git))))
+        """
+        MPJastrow = jnp.average(self.FJt[1](nn.swish(self.FJt[0](git))))
         MPBackflow = self.FBFt(git)
+        """
+        
+        selfTerm = self.neuralJastrow2(nn.swish(self.neuralJastrow1(gijt)))
+        neuralJastrow = jnp.average(selfTerm)
 
-        xs = rs + MPBackflow
+        backflow = jnp.average(
+            self.neuralBackflow2(nn.swish(self.neuralBackflow1(gijt))),
+            axis=1
+        )
+        xs = rs + backflow
         
         slaterUp = self.slaterUp(xs[:self.spins[0],:])
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
         
-        return slaterUp + slaterDown + CYJastrow + MPJastrow
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
 def uhfInitialization(r_ws, spins, numkPoints, seed=558):
     """

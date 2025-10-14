@@ -131,14 +131,14 @@ class StochasticReconfiguration:
         exp_O = jnp.average(parameterGrads, axis=0)
         exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
 
-        f_k = 2 * (exp_O * exp_H - exp_OH) * learningRateFlat
+        f_k = 2 * (exp_O * exp_H - exp_OH)
         
         cov = (parameterGrads.T @ parameterGrads) / parameterGrads.shape[0]
         s_jk = cov - jnp.outer(exp_O,exp_O)
         diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
         parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
-        maxNorm = 0.01 * jnp.linalg.norm(flatParameters)
-        scale = jnp.minimum(1.0, maxNorm / jnp.linalg.norm(parameterStep))
+        wfChange = jnp.sqrt(jnp.dot(f_k, parameterStep))
+        scale = jnp.minimum(learningRateFlat, 0.005 / wfChange)
         updatedParameters = unravel(flatParameters + scale * parameterStep)
 
         """
@@ -151,7 +151,9 @@ class StochasticReconfiguration:
         print("-------------------------------")
         """
         
-        return ( scale < 0.99 , localEnergies , updatedParameters )
+        maxNormRate = jnp.average(scale < 0.99 * learningRateFlat)
+
+        return ( maxNormRate , localEnergies , updatedParameters )
 
     def getParameterGradient(self, parameters, rs):
         localParameterGrads = self.parameterGrad(parameters, rs)
