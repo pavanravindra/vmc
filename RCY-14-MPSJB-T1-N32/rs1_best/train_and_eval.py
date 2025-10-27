@@ -1,8 +1,8 @@
 import sys, os
 
 sys.path.append("/burg-archive/ccce/users/phr2114/vmc")
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+#os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +30,7 @@ tau = 1.25
 walkers = 1024
 
 eqSteps      = 2000
-trainSteps   = 2000 # 1000
+trainSteps   = 2000
 trainEqSteps = 20
 evalSteps    = 1000
 
@@ -53,7 +53,7 @@ diagonalShift = 1e-3
 if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
-    hyperparameters[0] = optimization.logSample(1e-4,5e2)
+    hyperparameters[0] = optimization.logSample(1e-3,1e0)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
@@ -88,7 +88,7 @@ parameters = wavefunction.initBatch(init_rng, rs)
 #   Assign sampled hyperparameters to useful things                           #
 ###############################################################################
 
-eta0 = optimization.castFloatAsPytree(hyperparameters[0], parameters)
+eta0 = hyperparameters[0]
 
 
 ###############################################################################
@@ -150,7 +150,7 @@ startRs = rs
 
 for dt in range(trainSteps):
 
-    localLearningRate = optimization.scalarTimesParams(1 / (1 + (dt / T)), eta0)
+    localLearningRate = eta0 / (1 + (dt / T))
     ( maxNorm , currentEnergies , newParameters ) = updateParameters(
         parameters, rs, localLearningRate, diagonalShift
     )

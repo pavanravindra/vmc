@@ -7,6 +7,9 @@ import jax.flatten_util
 import flax.traverse_util
 from flax.core import FrozenDict
 
+def uniformSample(low, high):
+    return np.random.uniform(low, high)
+
 def logSample(low, high):
     return np.exp(np.random.uniform(np.log(low), np.log(high)))
 
@@ -115,17 +118,11 @@ class StochasticReconfiguration:
             self.getParameterGradient, in_axes=(None,0)
         )
 
-    def __call__(self, parameters, walkerRs, learningRate, diagonalShift=0.):
+    def __call__(self, parameters, walkerRs, learningRate, diagonalShift):
         
-        if isinstance(learningRate, (float, int)):
-            learningRateTree = castFloatAsPytree(learningRate, parameters)
-        else:
-            learningRateTree = learningRate
-
         localEnergies = self.localEnergy.batch(parameters, walkerRs)
         parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
         (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
-        (learningRateFlat,_) = jax.flatten_util.ravel_pytree(learningRateTree)
 
         exp_H = jnp.average(localEnergies)
         exp_O = jnp.average(parameterGrads, axis=0)
@@ -137,23 +134,16 @@ class StochasticReconfiguration:
         s_jk = cov - jnp.outer(exp_O,exp_O)
         diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
         parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
-        wfChange = jnp.sqrt(jnp.dot(f_k, parameterStep))
-        scale = jnp.minimum(learningRateFlat, 0.005 / wfChange)
-        updatedParameters = unravel(flatParameters + scale * parameterStep)
+        fisherNorm = jnp.dot(f_k, parameterStep)
+        diagonalCorrection = diagonalShift * jnp.linalg.norm(parameterStep)**2
+        fisherNorm = jnp.sqrt(
+            jnp.maximum(fisherNorm - diagonalCorrection, 1e-8)
+        )
+        scale = jnp.minimum(1.0, 1.0 / fisherNorm)
+        parameterStep = scale * learningRate * parameterStep
+        updatedParameters = unravel(flatParameters + parameterStep)
 
-        """
-        print(s_jk)
-        print(f_k)
-        print(scale)
-        print(parameterStep)
-        print(flatParameters + scale * parameterStep)
-
-        print("-------------------------------")
-        """
-        
-        maxNormRate = jnp.average(scale < 0.99 * learningRateFlat)
-
-        return ( maxNormRate , localEnergies , updatedParameters )
+        return ( scale < 1.0 , localEnergies , updatedParameters )
 
     def getParameterGradient(self, parameters, rs):
         localParameterGrads = self.parameterGrad(parameters, rs)
@@ -224,7 +214,7 @@ class StochasticReconfigurationMomentum:
 
         localEnergies = self.localEnergy.batch(parameters, walkerRs)
         parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
-        (_,unravel) = jax.flatten_util.ravel_pytree(parameters)
+        (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
 
         exp_H = jnp.average(localEnergies)
         exp_O = jnp.average(parameterGrads, axis=0)
@@ -233,14 +223,22 @@ class StochasticReconfigurationMomentum:
         g_k = 2 * (exp_O * exp_H - exp_OH)
         f_k = g_k + diagonalShift * mu * history
 
-        jk_traj = parameterGrads.T[:,None,:] * parameterGrads.T[None,:,:]
-        s_jk = jnp.average(jk_traj, axis=2) - jnp.outer(exp_O,exp_O)
+        cov = (parameterGrads.T @ parameterGrads) / parameterGrads.shape[0]
+        s_jk = cov - jnp.outer(exp_O,exp_O)
         diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
-        parameterDirection = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
-        parameterStep = unravel(learningRate * parameterDirection)
-        updatedParameters = addTrees(parameters, parameterStep)
-        
-        return (updatedParameters,parameterDirection)
+        parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
+        fisherNorm = jnp.dot(f_k, parameterStep)
+        diagonalCorrection = diagonalShift * jnp.linalg.norm(parameterStep)**2
+        fisherNorm = jnp.sqrt(
+            jnp.maximum(fisherNorm - diagonalCorrection, 1e-8)
+        )
+        scale = jnp.minimum(1.0, 1.0 / fisherNorm)
+        history = scale * parameterStep
+        parameterStep = scale * learningRate * parameterStep
+        updatedParameters = unravel(flatParameters + parameterStep)
+
+        return ( scale < 1.0 , localEnergies , updatedParameters , history )
+
 
     def getParameterGradient(self, parameters, rs):
         localParameterGrads = self.parameterGrad(parameters, rs)
