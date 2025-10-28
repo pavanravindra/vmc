@@ -52,13 +52,17 @@ diagonalShift = 1e-3
 
 if not os.path.exists("hyperparameters.txt"):
     
-    hyperparameters = np.full(1, np.nan)
+    hyperparameters = np.full(2, np.nan)
     hyperparameters[0] = optimization.logSample(xxxLRMIN0xxx,xxxLRMAX0xxx)
+    hyperparameters[1] = optimization.uniformSample(xxxMUMIN0xxx,xxxMUMAX0xxx)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
 
 print("HYPERPARAMETERS: " + str(hyperparameters))
+
+eta0 = hyperparameters[0]
+mu = hyperparameters[1]
 
 
 ###############################################################################
@@ -71,7 +75,9 @@ wavefunction = wavefunctions.LogMessagePassingSJB(
 )
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
-optimizer = optimization.StochasticReconfiguration(wavefunction, localEnergy)
+optimizer = optimization.StochasticReconfigurationMomentum(
+    wavefunction, localEnergy
+)
 
 updateWalkerPositions = jax.jit(mala.updateBatch)
 computeEnergies = jax.jit(localEnergy.batch)
@@ -82,14 +88,6 @@ rng = jax.random.PRNGKey(558)
 rng, rs_rng, init_rng = jax.random.split(rng, 3)
 rs = trajectory.wignerCrystal(spins, r_ws, L, walkers, rs_rng, dim=3)
 parameters = wavefunction.initBatch(init_rng, rs)
-
-
-###############################################################################
-#   Assign sampled hyperparameters to useful things                           #
-###############################################################################
-
-eta0 = hyperparameters[0]
-
 
 ###############################################################################
 #   Equilibrating walkers before parameter optimization                       #
@@ -145,14 +143,15 @@ if np.min(acceptArrays) < 0.4:
 print("Starting optimization...")
 
 rng = jax.random.PRNGKey(151)
+history = 0
 
 startRs = rs
 
 for dt in range(trainSteps):
 
     localLearningRate = eta0 / (1 + (dt / T))
-    ( maxNorm , currentEnergies , newParameters ) = updateParameters(
-        parameters, rs, localLearningRate, diagonalShift
+    ( maxNorm , currentEnergies , newParameters , history ) = updateParameters(
+        parameters, rs, localLearningRate, diagonalShift, mu, history
     )
 
     if optimization.hasnan(newParameters):

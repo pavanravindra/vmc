@@ -1,4 +1,4 @@
-while read -r rs lrMin0 lrMax0;
+while read -r rs lrMin0 lrMax0 muMin0 muMax0;
 do
 
 	for ((i=0; i<16; i++));
@@ -17,6 +17,8 @@ do
 		sed -i "s/xxxRSxxx/${rs}/g" train_and_eval.py
 		sed -i "s/xxxLRMIN0xxx/${lrMin0}/g" train_and_eval.py
 		sed -i "s/xxxLRMAX0xxx/${lrMax0}/g" train_and_eval.py
+		sed -i "s/xxxMUMIN0xxx/${muMin0}/g" train_and_eval.py
+		sed -i "s/xxxMUMAX0xxx/${muMax0}/g" train_and_eval.py
 
 		sbatch submit_training.sh 
 

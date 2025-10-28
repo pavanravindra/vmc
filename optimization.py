@@ -140,6 +140,7 @@ class StochasticReconfiguration:
             jnp.maximum(fisherNorm - diagonalCorrection, 1e-8)
         )
         scale = jnp.minimum(1.0, 1.0 / fisherNorm)
+        scale = jnp.minimum(scale, 1.0 / jnp.linalg.norm(parameterStep))
         parameterStep = scale * learningRate * parameterStep
         updatedParameters = unravel(flatParameters + parameterStep)
 
@@ -233,6 +234,7 @@ class StochasticReconfigurationMomentum:
             jnp.maximum(fisherNorm - diagonalCorrection, 1e-8)
         )
         scale = jnp.minimum(1.0, 1.0 / fisherNorm)
+        scale = jnp.minimum(scale, 1.0 / jnp.linalg.norm(parameterStep))
         history = scale * parameterStep
         parameterStep = scale * learningRate * parameterStep
         updatedParameters = unravel(flatParameters + parameterStep)
