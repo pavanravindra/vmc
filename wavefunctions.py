@@ -573,6 +573,182 @@ def uhfInitialization(r_ws, spins, numkPoints, seed=558):
 
     return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
 
+class LogFixedCYJastrow(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
+    and different spin electrons are handled by different $A$ parameters.
+
+    The conventional $F$ parameters are set by the cusp conditions.
+
+    IMPORTANT: These $A$ parameters are *fixed* in this class! 
+
+    NOTE: In this implementation, we always take the absolute values of the $A$
+    parameters. This is so that even if negative values are encountered during
+    optimization, the resulting wavefunction remains physical.
+    """
+    spins : (int,int)
+    L : float
+
+    def setup(self):
+
+        N = self.spins[0] + self.spins[1]
+        n = N / (self.L**3.)
+        self.A = 1.0 / jnp.sqrt(4 * jnp.pi * n)
+
+    def __call__(self, rs):
+
+        A_same = self.A
+        A_diff = self.A
+        
+        F_same = jnp.sqrt(2 * A_same)
+        F_diff = jnp.sqrt(A_diff)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        disps = (disps + self.L/2) % self.L - self.L/2
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+        r_ij = jnp.linalg.norm(disps, axis=-1)
+
+        same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
+        same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
+        sameDists = jnp.concatenate([same_up, same_down])
+        sameCY = coulombYukawa(sameDists, A_same, F_same, self.L)
+        
+        diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
+        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
+
+        return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
+
+class LogSlaterFixedCYJastrow(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two simple Slater
+    determinant with the lowest k-points filled and a Coulomb-Yukawa Jastrow.
+
+    Since the CYJastrow's parameters are fixed, there are no variational
+    parameters in this wavefunction class.
+    """
+    spins : (int,int)
+    L : float
+
+    def setup(self):
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
+        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
+
+    def __call__(self, rs):
+        slaterUp = self.slaterUp(rs[:self.spins[0],:])
+        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
+        return slaterUp + slaterDown + CYJastrow
+
+class LogWignerCrystalSlater(Wavefunction):
+    """
+    Slater determinant reference for a 3D Wigner crystal.
+
+    Spin-up electrons: simple cubic grid
+    Spin-down electrons: shifted grid (BCC counterpart)
+    
+    Orbitals: exp(-alpha * |r - R_j|^2) with minimum-image PBC.
+
+    Inputs:
+      spins = (N_up, N_down)
+      L     = box length
+    """
+
+    spins: (int,int)
+    L: float
+
+    def setup(self):
+        N_up, N_dn = self.spins
+        N = N_up + N_dn
+        
+        # Variational Gaussian width alpha = exp(log_alpha) > 0
+        self.log_alpha = self.param(
+            "log_alpha", lambda rng: jnp.array(-2.0)  # alpha ~ 0.135
+        )
+
+        # Construct lattice centers
+        self.centers_up, self.centers_dn = self._create_centers(N_up, N_dn, self.L)
+
+    @staticmethod
+    def _create_centers(N_up, N_dn, L):
+        """
+        Make cubic lattice positions, then shift for spin-down electrons
+        to form the BCC structure. Truncate to required counts.
+        """
+        # smallest n with n^3 >= max(N_up, N_dn)
+        n = 1
+        while n**3 < max(N_up, N_dn):
+            n += 1
+        
+        a = L / n                          # cubic cell spacing
+        coords = jnp.linspace(0, L - a, n)
+
+        # simple cubic grid
+        grid = jnp.stack(jnp.meshgrid(coords, coords, coords, indexing="ij"), axis=-1)
+        grid = grid.reshape(-1, 3)
+
+        # spin-up = cubic sites
+        centers_up = grid[:N_up]
+
+        # spin-down = BCC shift (half cell in all dims)
+        shift = jnp.array([a/2, a/2, a/2])
+        centers_dn = (grid + shift)[:N_dn]
+
+        return centers_up, centers_dn
+
+    def _min_image(self, dr):
+        """Apply minimum-image convention for PBC."""
+        return dr - self.L * jnp.round(dr / self.L)
+
+    def _slater_logdet(self, rs, centers, alpha):
+        """Compute log(det Phi) for a given spin sector."""
+        def row(ri):
+            dr = ri[None, :] - centers  # (Nspin, 3)
+            dr = self._min_image(dr)
+            r2 = jnp.sum(dr * dr, axis=-1)
+            return jnp.exp(-alpha * r2)  # (Nspin,)
+
+        Phi = jax.vmap(row)(rs)
+        sign, logdet = jnp.linalg.slogdet(Phi)
+        return logdet  # phase dropped for ground-state VMC
+
+    def __call__(self, rs):
+        """
+        rs shape = (N_up + N_dn, 3)
+        returns log |det_up * det_dn|
+        """
+        N_up, N_dn = self.spins
+        rs_up = rs[:N_up]
+        rs_dn = rs[N_up:N_up+N_dn]
+
+        alpha = jnp.exp(self.log_alpha)
+
+        log_slater_up = self._slater_logdet(rs_up, self.centers_up, alpha)
+        log_slater_dn = self._slater_logdet(rs_dn, self.centers_dn, alpha)
+
+        return log_slater_up + log_slater_dn
+
+class LogWignerCrystalSlaterFixedCYJastrow(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two simple Slater
+    determinant with the Wigner crystal as the reference state.
+
+    Since the CYJastrow's parameters are fixed, there are no variational
+    parameters in this wavefunction class.
+    """
+    spins : (int,int)
+    L : float
+
+    def setup(self):
+        self.wignerSlater = LogWignerCrystalSlater(self.spins, self.L)
+        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
+
+    def __call__(self, rs):
+        wignerSlater = self.wignerSlater(rs)
+        CYJastrow = self.CYJastrow(rs)
+        return wignerSlater + CYJastrow
+
 class LogUHFSlaters(Wavefunction):
     """
     Creates a log-wavefunction that is the product of two unrestricted Slater
