@@ -647,22 +647,21 @@ class LogWignerCrystalSlater(Wavefunction):
 
     Spin-up electrons: simple cubic grid
     Spin-down electrons: shifted grid (BCC counterpart)
-    
-    Orbitals: exp(-alpha * |r - R_j|^2) with minimum-image PBC.
+
+    Orbitals: exp(-alpha * |r - R_j|^2) using minimum-image convention only.
 
     Inputs:
       spins = (N_up, N_down)
       L     = box length
     """
 
-    spins: (int,int)
+    spins: tuple
     L: float
 
     def setup(self):
         N_up, N_dn = self.spins
-        N = N_up + N_dn
-        
-        # Variational Gaussian width alpha = exp(log_alpha) > 0
+
+        # Variational Gaussian width parameter (alpha = exp(log_alpha))
         self.log_alpha = self.param(
             "log_alpha", lambda rng: jnp.array(-2.0)  # alpha ~ 0.135
         )
@@ -672,46 +671,46 @@ class LogWignerCrystalSlater(Wavefunction):
 
     @staticmethod
     def _create_centers(N_up, N_dn, L):
-        """
-        Make cubic lattice positions, then shift for spin-down electrons
-        to form the BCC structure. Truncate to required counts.
-        """
-        # smallest n with n^3 >= max(N_up, N_dn)
+        """Create cubic lattice + BCC-shifted centers for spin-up and spin-down."""
         n = 1
         while n**3 < max(N_up, N_dn):
             n += 1
-        
-        a = L / n                          # cubic cell spacing
+
+        a = L / n
         coords = jnp.linspace(0, L - a, n)
 
-        # simple cubic grid
+        # Simple cubic grid
         grid = jnp.stack(jnp.meshgrid(coords, coords, coords, indexing="ij"), axis=-1)
         grid = grid.reshape(-1, 3)
 
-        # spin-up = cubic sites
         centers_up = grid[:N_up]
-
-        # spin-down = BCC shift (half cell in all dims)
         shift = jnp.array([a/2, a/2, a/2])
         centers_dn = (grid + shift)[:N_dn]
 
         return centers_up, centers_dn
 
     def _min_image(self, dr):
-        """Apply minimum-image convention for PBC."""
+        """Apply minimum-image convention for periodic boundary conditions."""
         return dr - self.L * jnp.round(dr / self.L)
 
-    def _slater_logdet(self, rs, centers, alpha):
-        """Compute log(det Phi) for a given spin sector."""
-        def row(ri):
-            dr = ri[None, :] - centers  # (Nspin, 3)
-            dr = self._min_image(dr)
-            r2 = jnp.sum(dr * dr, axis=-1)
-            return jnp.exp(-alpha * r2)  # (Nspin,)
+    def _orbital_single_center(self, ri, Rj, alpha):
+        """
+        Compute the value of one Gaussian orbital φ_j(r_i) centered at Rj.
+        No periodic image summation yet — just minimum-image distance.
+        """
+        dr = self._min_image(ri - Rj)
+        r2 = jnp.dot(dr, dr)
+        return jnp.exp(-alpha * r2)
 
-        Phi = jax.vmap(row)(rs)
+    def _orbital_row(self, ri, centers, alpha):
+        """Compute all orbitals φ_j(r_i) for a given electron position r_i."""
+        return jax.vmap(lambda Rj: self._orbital_single_center(ri, Rj, alpha))(centers)
+
+    def _slater_logdet(self, rs, centers, alpha):
+        """Compute log(det Φ) for a given spin sector."""
+        Phi = jax.vmap(lambda ri: self._orbital_row(ri, centers, alpha))(rs)
         sign, logdet = jnp.linalg.slogdet(Phi)
-        return logdet  # phase dropped for ground-state VMC
+        return logdet
 
     def __call__(self, rs):
         """
@@ -720,7 +719,7 @@ class LogWignerCrystalSlater(Wavefunction):
         """
         N_up, N_dn = self.spins
         rs_up = rs[:N_up]
-        rs_dn = rs[N_up:N_up+N_dn]
+        rs_dn = rs[N_up:N_up + N_dn]
 
         alpha = jnp.exp(self.log_alpha)
 
@@ -728,6 +727,7 @@ class LogWignerCrystalSlater(Wavefunction):
         log_slater_dn = self._slater_logdet(rs_dn, self.centers_dn, alpha)
 
         return log_slater_up + log_slater_dn
+
 
 class LogWignerCrystalSlaterFixedCYJastrow(Wavefunction):
     """
