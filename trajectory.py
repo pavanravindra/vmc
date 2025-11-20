@@ -109,7 +109,7 @@ def wignerCrystal(spins, r_ws, L, walkers, rng, dim=3):
 
     noise = (r_ws / 10) * jax.random.normal(rng, shape=allWalkers.shape)
 
-    return allWalkers + noise
+    return allWalkers # + noise
 
 def acceptanceArray(rs1, rs2):
     """
