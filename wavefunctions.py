@@ -643,150 +643,100 @@ class LogSlaterFixedCYJastrow(Wavefunction):
 
 class LogWignerCrystalSlater(Wavefunction):
     """
-    Slater determinant reference for a 3D Wigner crystal with localized
-    Gaussian orbitals on a BCC-like lattice, using a finite 3x3x3 image sum.
+    Slater determinant reference for a 3D Wigner crystal.
 
     Spin-up electrons  -> simple cubic sites
     Spin-down electrons -> BCC-shifted sites
 
-    Orbital (for each center R_j):
-        φ_j(r_i) = sum_{n in {-1,0,1}^3} exp( -α * | r_i - (R_j + n L) |^2 )
+    Orbital:
+        φ_j(r_i) = exp( -alpha * | d_pbc(r_i - R_j) |^2 )
+    where d_pbc uses periodic sine distance, NOT min-image,
+    giving a smooth & exactly periodic Gaussian-like bump.
 
-    We clip α to keep Gaussians localized enough that contributions at the
-    edge of the 3×3×3 block are negligible; this avoids weird kinetic-energy
-    artifacts from very broad orbitals at small r_s.
-
-    - The ansatz is *not* meant to be good at small r_s (delocalized phase),
-      but should be a decent WC reference at large r_s.
+    This removes boundary cusps and yields a fully variational,
+    JIT-friendly reference state.
     """
 
-    spins: tuple          # (N_up, N_dn)
-    L: float              # box length
+    spins: tuple
+    L: float
 
     def setup(self):
         N_up, N_dn = self.spins
-    
-        # Gaussian width parameter
+
+        # Variational Gaussian width alpha = exp(log_alpha)
         self.log_alpha = self.param(
-            "log_alpha", lambda rng: jnp.array(-2.0)
+            "log_alpha", lambda rng: jnp.array(-2.0)  # alpha ~ 0.135
         )
 
-        # Lattice centers
+        # Lattice centers (SC grid for ↑, BCC shift for ↓)
         self.centers_up, self.centers_dn = self._create_centers(N_up, N_dn, self.L)
-    
-        # Precompute 3×3×3 image shifts as a NON-trainable variable
-        offsets_1d = jnp.array([-1.0, 0.0, 1.0])
-        off_grid = jnp.stack(
-            jnp.meshgrid(offsets_1d, offsets_1d, offsets_1d, indexing="ij"),
-            axis=-1
-        )
-        shifts = off_grid.reshape(-1, 3) * self.L  # shape (27,3)
-    
-        # Store as a non-trainable Flax variable
-        self.image_shifts = self.variable(
-            "constants", "image_shifts", lambda: shifts
-        )
 
-    # ---------------------------------------------------------------------
-    # Lattice centers: SC for spin-up, BCC-shifted SC for spin-down
-    # ---------------------------------------------------------------------
     @staticmethod
     def _create_centers(N_up, N_dn, L):
         """
-        Construct cubic sites (for spin-up) and BCC-shifted cubic sites
-        (for spin-down). Combined, these form a BCC-like pattern.
+        Construct cubic sites (for spin-up), and BCC-shifted cubic sites
+        (for spin-down), just like the standard WC reference ansatz.
         """
         # Smallest n such that n^3 ≥ max(N_up, N_dn)
         n = 1
-        maxN = max(N_up, N_dn)
-        while n**3 < maxN:
+        while n**3 < max(N_up, N_dn):
             n += 1
 
-        a = L / n  # SC lattice spacing
-        # Equally spaced grid points in [0, L)
-        coords = jnp.linspace(0.0, L - a, n)
+        a = L / n
+        coords = jnp.linspace(0, L - a, n)
         grid = jnp.stack(jnp.meshgrid(coords, coords, coords, indexing="ij"), axis=-1)
-        grid = grid.reshape(-1, 3)  # (n^3, 3)
+        grid = grid.reshape(-1, 3)
 
         centers_up = grid[:N_up]
-
-        # BCC shift by (a/2, a/2, a/2)
         shift = jnp.array([a/2, a/2, a/2])
         centers_dn = (grid + shift)[:N_dn]
 
         return centers_up, centers_dn
 
-    # ---------------------------------------------------------------------
-    # Orbital building blocks
-    # ---------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # Periodic SINE distance: smooth and analytic everywhere
+    # ----------------------------------------------------------
+    def _periodic_displacement(self, dr):
+        """
+        Component-wise periodic displacement using sine distance:
+           d_per(x) = (L/pi) * sin(pi*x/L)
+        This is exactly periodic and smooth; removes cusps.
+        """
+        return (self.L / jnp.pi) * jnp.sin(jnp.pi * dr / self.L)
+
     def _orbital_single_center(self, ri, Rj, alpha):
         """
-        Gaussian orbital centered at Rj with 3x3x3 image sum:
-
-            φ_j(r_i) = Σ_{n∈{-1,0,1}^3} exp(-α |r_i - (Rj + nL)|^2)
-
-        ri: (3,)
-        Rj: (3,)
-        image_shifts: (27, 3)
+        Gaussian-like orbital centered at Rj, using sine-periodic displacement.
         """
-        # (27, 3): positions of the center in neighboring cells
-        centers_images = Rj + self.image_shifts.value  # broadcasting over (27, 3)
-
-        # (27, 3): displacements from all images
-        dr = ri - centers_images
-
-        # (27,): squared distances
-        r2 = jnp.sum(dr * dr, axis=-1)
-
-        # Sum over images
-        dr0 = self.image_shifts.value
-        r20 = jnp.sum(dr0 * dr0, axis=-1)
-        peak = jnp.sum(jnp.exp(-alpha * r20))
-        return jnp.sum(jnp.exp(-alpha * r2)) / peak
+        dr = ri - Rj                     # (3,)
+        dr_p = self._periodic_displacement(dr)  # smooth periodic displacement
+        r2 = jnp.dot(dr_p, dr_p)
+        return jnp.exp(-alpha * r2)
 
     def _orbital_row(self, ri, centers, alpha):
         """
-        All orbitals φ_j(r_i) for a single electron position ri.
-
-        ri: (3,)
-        centers: (N_spin, 3)
-        returns: (N_spin,)
+        Returns all orbitals φ_j(ri) for a fixed ri.
         """
-        single = lambda Rj: self._orbital_single_center(ri, Rj, alpha)
-        return jax.vmap(single)(centers)
+        return jax.vmap(lambda Rj: self._orbital_single_center(ri, Rj, alpha))(centers)
 
     def _slater_logdet(self, rs_spin, centers, alpha):
         """
         Build and take logdet of the Slater matrix Φ_{ij} = φ_j(r_i).
-
-        rs_spin: (N_spin, 3)
-        centers: (N_spin, 3)
         """
-        # Φ shape: (N_spin, N_spin)
         Phi = jax.vmap(lambda ri: self._orbital_row(ri, centers, alpha))(rs_spin)
-
         sign, logdet = jnp.linalg.slogdet(Phi)
-        # For WC we can ignore the overall sign and just use |det|
-        return logdet
+        return logdet  # ignore sign: ground-state WF is real-positive gauge
 
-    # ---------------------------------------------------------------------
-    # Public call: log |det_up * det_dn|
-    # ---------------------------------------------------------------------
     def __call__(self, rs):
         """
         rs shape = (N_up + N_dn, 3)
         Returns log |det_up * det_dn|.
         """
         N_up, N_dn = self.spins
-        rs = rs % self.L # move everything into [0,L]
         rs_up = rs[:N_up]
         rs_dn = rs[N_up:N_up + N_dn]
 
-        # Exponentiate and clip alpha to keep Gaussians localized
         alpha = jnp.exp(self.log_alpha)
-        alpha_min = 55 / self.L**2
-        alpha_max = 300 / self.L**2
-        alpha = jnp.clip(alpha, alpha_min, alpha_max)
 
         log_up = self._slater_logdet(rs_up, self.centers_up, alpha)
         log_dn = self._slater_logdet(rs_dn, self.centers_dn, alpha)
