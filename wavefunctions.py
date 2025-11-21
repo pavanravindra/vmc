@@ -665,7 +665,9 @@ class LogWignerCrystalSlater(Wavefunction):
 
         # Variational Gaussian width alpha = exp(log_alpha)
         self.log_alpha = self.param(
-            "log_alpha", lambda rng: jnp.array(-2.0)  # alpha ~ 0.135
+            "log_alpha", lambda rng: jnp.array(
+                jnp.log(jnp.sqrt(100.0) / self.L**2)
+            )
         )
 
         # Lattice centers (SC grid for ↑, BCC shift for ↓)
@@ -737,6 +739,9 @@ class LogWignerCrystalSlater(Wavefunction):
         rs_dn = rs[N_up:N_up + N_dn]
 
         alpha = jnp.exp(self.log_alpha)
+        alpha_min = 0.5 / self.L**2
+        alpha_max = 200.0 / self.L**2
+        alpha = jnp.clip(alpha, alpha_min, alpha_max)
 
         log_up = self._slater_logdet(rs_up, self.centers_up, alpha)
         log_dn = self._slater_logdet(rs_dn, self.centers_dn, alpha)
@@ -880,7 +885,7 @@ class LogUMPCY(Wavefunction):
     """
     Slater-Jastrow wavefunction with following specs:
     - Slater: unrestricted sum of multiple planewaves
-    - Jastrow: Coulomb-Yukawa
+    - Jastrow: Fixed Coulomb-Yukawa
     """
     spins : (int,int)
     L : float
@@ -893,7 +898,7 @@ class LogUMPCY(Wavefunction):
             self.spins, self.L,
             self.kpoints, self.spinUpInit, self.spinDownInit
         )
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
 
     def __call__(self, rs):
         slater = self.slater(rs)
