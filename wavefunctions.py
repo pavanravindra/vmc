@@ -748,6 +748,69 @@ class LogWignerCrystalSlater(Wavefunction):
 
         return log_up + log_dn
 
+class LogTwoBodySJBGaussianWignerCrystal(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: Gaussians centered at BCC-like Wigner crystal sites
+    - Jastrow: Coulomb-Yukawa + neural function acting on pairwise information
+        NOTE: This basically comes up with the "best" two-body Jastrow.
+    - Backflow: acts purely on pairwise information to produce arbitrary
+                backflow coordinates
+    """
+    spins : (int,int)
+    L : float
+    hiddenFeatures : int
+
+    def setup(self):
+        
+        self.wignerSlater = LogWignerCrystalSlater(self.spins, self.L)
+        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        
+        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralJastrow2 = nn.Dense(1)
+        
+        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralBackflow2 = nn.Dense(3)
+
+    def __call__(self, rs):
+        
+        CYJastrow = self.CYJastrow(rs)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+
+        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
+        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
+        sinDispsMag = jnp.linalg.norm(
+            jnp.sin(jnp.pi * disps / self.L),
+            axis=-1, keepdims=True
+        )
+        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
+        
+        N = self.spins[0] + self.spins[1]
+        electronIdxs = jnp.arange(N)
+        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
+        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
+        
+        v_ij = jnp.concatenate(
+            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
+            axis=-1
+        )
+        
+        selfTerm = self.neuralJastrow2(nn.swish(self.neuralJastrow1(v_ij)))
+        neuralJastrow = jnp.average(selfTerm)
+
+        backflow = jnp.average(
+            self.neuralBackflow2(nn.swish(self.neuralBackflow1(v_ij))),
+            axis=1
+        )
+        xs = rs + backflow
+        
+        wignerSlater = self.wignerSlater(xs)
+        
+        return wignerSlater + CYJastrow + neuralJastrow
+
 class LogWignerCrystalSlaterFixedCYJastrow(Wavefunction):
     """
     Creates a log-wavefunction that is the product of two simple Slater
