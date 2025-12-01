@@ -1,7 +1,7 @@
 while read -r rs lrMin0 lrMax0 muMin0 muMax0;
 do
 
-	for ((i=0; i<1; i++));
+	for ((i=0; i<16; i++));
 	do
 
 		dirName="rs${rs}_trial${i}"

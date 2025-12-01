@@ -1,8 +1,8 @@
 import sys, os
 
 sys.path.append("/burg-archive/ccce/users/phr2114/vmc")
-#os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.numpy as jnp
@@ -69,7 +69,11 @@ mu = hyperparameters[1]
 #   Creating wavefunction, walker updater, optimizer, and local energy        #
 ###############################################################################
 
-wavefunction = wavefunctions.LogSlaterFixedCYJastrow(spins, L)
+#wavefunction = wavefunctions.LogMessagePassingSJB(
+    #spins, L, 3, 16, 16, 8, 8
+    #spins, L, 3, 32, 32, 24, 8
+#)
+wavefunction = wavefunctions.LogTwoBodySJB(spins, L, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
 optimizer = optimization.StochasticReconfigurationMomentum(
@@ -86,6 +90,106 @@ rng, rs_rng, init_rng = jax.random.split(rng, 3)
 rs = trajectory.wignerCrystal(spins, r_ws, L, walkers, rs_rng, dim=3)
 parameters = wavefunction.initBatch(init_rng, rs)
 
+###############################################################################
+#   Equilibrating walkers before parameter optimization                       #
+###############################################################################
+
+print("Starting equilibration...")
+
+rng = jax.random.PRNGKey(1126)
+
+startRs = rs
+acceptRates = [np.nan]
+acceptArrays = np.zeros(walkers)
+
+for dt in range(eqSteps):
+
+    if dt % 100 == 0:
+        avgRate = np.average(np.array(acceptRates))
+        acceptRates = []
+        print("Step {:5d}   Acc Rate {:4f}   tau = {:.5f}".format(dt,avgRate,tau))
+
+    rng, traj_rng = jax.random.split(rng, 2)
+    newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
+
+    acceptRate = trajectory.acceptanceRate(rs, newRs)
+    
+    acceptRates.append(acceptRate)
+    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
+
+    if acceptRate < acceptMin:
+        tau = tau * 0.9
+    elif acceptRate > acceptMax:
+        tau = tau * 1.1
+
+    rs = newRs
+
+print("Finished equilibration!\n")
+
+print(np.sort(acceptArrays)[:10])
+
+if np.min(acceptArrays) < 0.4:
+    np.savetxt("FAILED_EQUILIBRATE", [])
+    np.save("big_acceptArrays.npy", acceptArrays)
+    np.save("big_startRs.npy", startRs)
+    np.save("big_endRs.npy", rs)
+    raise Exception("DEAD WALKER DURING EQUILIBRATION")
+
+###############################################################################
+#   Parameter optimization                                                    #
+###############################################################################
+
+
+print("Starting optimization...")
+
+rng = jax.random.PRNGKey(151)
+history = 0
+
+startRs = rs
+
+for dt in range(trainSteps):
+
+    localLearningRate = eta0 / (1 + (dt / T))
+    ( maxNorm , currentEnergies , newParameters , history ) = updateParameters(
+        parameters, rs, localLearningRate, diagonalShift, mu, history
+    )
+
+    if optimization.hasnan(newParameters):
+        np.savetxt("FAILED_REEQUILIBRATE", [])
+        wavefunctions.saveParameters(
+            "parameters_failed.msgpack", parameters
+        )
+        np.save("big_startRs.npy", startRs)
+        np.save("big_endRs.npy", rs)
+        raise Exception("Parameters have somehow NaNed...")
+
+    parameters = newParameters
+
+    acceptArrays = np.zeros(walkers)
+
+    for _ in range(trainEqSteps):
+
+        rng, traj_rng = jax.random.split(rng, 2)
+        newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
+
+        acceptRate = trajectory.acceptanceRate(rs, newRs)
+        if acceptRate < acceptMin:
+            tau = tau * 0.9
+        elif acceptRate > acceptMax:
+            tau = tau * 1.1
+
+        acceptArrays += trajectory.acceptanceArray(rs, newRs) / trainEqSteps
+
+        rs = newRs
+
+    print("Step {:5d}   Energy: {:.5f}   Norm: {:5}   Min Acc: {:.3f}   Avg Acc: {:.3f}   Param Norm: {:.5f}".format(
+        dt, jnp.average(currentEnergies) / N, str(maxNorm),
+        np.min(acceptArrays), np.average(acceptArrays), np.linalg.norm(optimization.flatten(parameters))
+    ))
+
+print("Finished optimization!\n")
+
+wavefunctions.saveParameters("parameters.msgpack", parameters)
 
 ###############################################################################
 #   Equilibrating walkers before energy evaluations                           #
@@ -127,14 +231,12 @@ for dt in range(eqSteps):
 print("Finished equilibration!\n")
 
 print(np.sort(acceptArrays)[:10])
-
 if np.min(acceptArrays) < 0.4:
     np.savetxt("FAILED_REEQUILIBRATE", [])
     np.save("big_acceptArrays.npy", acceptArrays)
     np.save("big_startRs.npy", startRs)
     np.save("big_endRs.npy", rs)
     raise Exception("DEAD WALKER DURING RE-EQUILIBRATION")
-
 
 ###############################################################################
 #   Energy evaluation                                                         #

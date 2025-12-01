@@ -70,6 +70,7 @@ mu = hyperparameters[1]
 ###############################################################################
 
 wavefunction = wavefunctions.LogWignerCrystalSlaterFixedCYJastrow(spins, L)
+wavefunction = wavefunctions.LogTwoBodySJBGaussianWignerCrystal(spins, L, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, L, truncationLimit=5)
 optimizer = optimization.StochasticReconfigurationMomentum(
@@ -182,7 +183,6 @@ for dt in range(trainSteps):
         dt, jnp.average(currentEnergies) / N, str(maxNorm),
         np.min(acceptArrays), np.average(acceptArrays), np.linalg.norm(optimization.flatten(parameters))
     ))
-    print(parameters['params']['wignerSlater']['log_alpha'])
 
 print("Finished optimization!\n")
 
