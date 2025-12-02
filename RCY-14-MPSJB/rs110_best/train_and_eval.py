@@ -42,8 +42,9 @@ L = wavefunctions.computeL(N, r_ws)
 
 ( acceptMin , acceptMax ) = ( 0.55 , 0.65 )
 
-T = 1000
+T = trainSteps / 2
 diagonalShift = 1e-3
+mu = 0.9
 
 
 ###############################################################################
@@ -52,9 +53,8 @@ diagonalShift = 1e-3
 
 if not os.path.exists("hyperparameters.txt"):
     
-    hyperparameters = np.full(2, np.nan)
+    hyperparameters = np.full(1, np.nan)
     hyperparameters[0] = optimization.logSample(1e-3,1e0)
-    hyperparameters[1] = optimization.uniformSample(0.01,0.99)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
@@ -62,7 +62,6 @@ hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
 print("HYPERPARAMETERS: " + str(hyperparameters))
 
 eta0 = hyperparameters[0]
-mu = hyperparameters[1]
 
 
 ###############################################################################

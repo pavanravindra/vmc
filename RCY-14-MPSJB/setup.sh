@@ -17,8 +17,6 @@ do
 		sed -i "s/xxxRSxxx/${rs}/g" train_and_eval.py
 		sed -i "s/xxxLRMIN0xxx/${lrMin0}/g" train_and_eval.py
 		sed -i "s/xxxLRMAX0xxx/${lrMax0}/g" train_and_eval.py
-		sed -i "s/xxxMUMIN0xxx/${muMin0}/g" train_and_eval.py
-		sed -i "s/xxxMUMAX0xxx/${muMax0}/g" train_and_eval.py
 
 		sbatch submit_training.sh 
 
