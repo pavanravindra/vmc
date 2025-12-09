@@ -54,7 +54,7 @@ mu = 0.9
 if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
-    hyperparameters[0] = optimization.logSample(1e-3,1e0)
+    hyperparameters[0] = optimization.logSample(5e-2,1e0)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
