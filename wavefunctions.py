@@ -12,14 +12,26 @@ import numpy as np
 
 import itertools
 
-def computeL(N, r_ws):
-    n = 3. / (4. * jnp.pi * (r_ws ** 3.))
-    V = N / n
-    L = V ** (1./3.)
-    return L
+def computeL(N, r_ws, dim):
+    if dim == 2:
+        area = jnp.pi * (r_ws ** 2) * N
+        L = jnp.sqrt(area)
+        return L
+    elif dim == 3:
+        n = 3. / (4. * jnp.pi * (r_ws ** 3.))
+        V = N / n
+        L = V ** (1./3.)
+        return L
+    else:
+        raise Exception("Only dim=2 or dim=3 are supported.")
 
-def computeRws(N, L):
-    return L * (3. / (4. * jnp.pi * N)) ** (1./3.)
+def computeRws(N, L, dim):
+    if dim == 2:
+        return  L / jnp.sqrt(jnp.pi * N)
+    elif dim == 3:
+        return L * (3. / (4. * jnp.pi * N)) ** (1./3.)
+    else:
+        raise Exception("Only dim=2 or dim=3 are supported.")
 
 class Wavefunction(nn.Module):
     """
@@ -51,7 +63,7 @@ def loadParameters(filename):
         parameters = from_bytes(FrozenDict, f.read())
     return parameters
 
-def genKpoints(N, L):
+def genKpoints(N, L, dim):
     """
     Generate as many k-points as needed to represent N electrons in a cubic box
     with side length L. To make jax happy, we always return exactly N k-points,
@@ -61,14 +73,17 @@ def genKpoints(N, L):
     FermiNet! The original code is from the `make_kpoints` function from
     `ferminet/pbc/envelopes.py`.
     """
+
+    if not (dim == 2 or dim == 3):
+        raise Exception("Only dim=2 or dim=3 are supported.")
     
     recUnitVectorLength = 2 * jnp.pi / L
     
     dk = 1 + 1e-5
     
-    max_k = int((N * dk)**(1/3) + 0.5)
+    max_k = int((N * dk)**(1/dim) + 0.5)
     ordinals = sorted(range(-max_k, max_k+1), key=abs)
-    ordinals = jnp.array(list(itertools.product(ordinals, repeat=3)))
+    ordinals = jnp.array(list(itertools.product(ordinals, repeat=dim)))
     
     kpoints = ordinals * recUnitVectorLength
     kpointsOrder = jnp.argsort(jnp.linalg.norm(kpoints, axis=1))
@@ -136,23 +151,32 @@ class LogSimpleSlater(Wavefunction):
     """
     N : int
     L : float
+    dim : int
 
     def setup(self):
-        self.kpoints = genKpoints(self.N, self.L)
+        
+        if not (self.dim == 2 or self.dim == 3):
+            raise Exception("Only dim=2 or dim=3 are supported.")
+            
+        self.kpoints = genKpoints(self.N, self.L, dim=self.dim)
+        weights = 10.0 ** jnp.arange(1, self.dim + 1)
+        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
+        k_signs = jnp.sign(weighted_sums + 1.0)
+        self.cos_switch = (k_signs + 1.0) / 2.0
+        self.sin_switch = (1.0 - k_signs) / 2.0
 
     def __call__(self, rs):
         def makeSimpleSlaterRow(ri):
-            def localKpointFunction(k):
-                sign = jnp.sign(
-                    1000. * jnp.sign(k[2]) +
-                    100. * jnp.sign(k[1]) +
-                    10. * jnp.sign(k[0]) +
-                    1.
-                )
-                cosSwitch = (sign + 1.) / 2. * jnp.cos(jnp.dot(k, ri))
-                sinSwitch = (1. - sign) / 2. * jnp.sin(jnp.dot(-k, ri))
-                return cosSwitch + sinSwitch
-            return jax.vmap(localKpointFunction)(self.kpoints)
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                term = (c_switch * jnp.cos(dot_val) + 
+                        s_switch * jnp.sin(-dot_val))
+                return term
+            return jax.vmap(localKpointFunction)(
+                self.kpoints, 
+                self.cos_switch, 
+                self.sin_switch
+            )
         slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
         return jnp.linalg.slogdet(slaterMatrix)[1]
 
@@ -229,6 +253,26 @@ class LogCYJastrow(Wavefunction):
         diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
 
         return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
+
+class LogSimpleSlaters(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two simple Slater
+    determinant with the lowest k-points filled and a Coulomb-Yukawa Jastrow.
+
+    There are 2 variational parameters, both in the Jastrow.
+    """
+    spins : (int,int)
+    L : float
+    dim : int
+
+    def setup(self):
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.L, dim=self.dim)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.L, dim=self.dim)
+
+    def __call__(self, rs):
+        slaterUp = self.slaterUp(rs[:self.spins[0],:])
+        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+        return slaterUp + slaterDown
 
 class LogSlaterCYJastrow(Wavefunction):
     """
