@@ -59,23 +59,23 @@ class EwaldPotential(LocalEnergy):
     Evaluates the infinite Coulomb sum for a bunch of electrons on a periodic lattice.
     """
     
-    def __init__(self, L, truncationLimit=2):
-        
-        self.L = L
+    def __init__(self, lattice, truncationLimit=2):
+
+        self.lattice = lattice
         self.truncationLimit = truncationLimit
         
-        self.volume = L**3
-        self.gamma = (2.8 / L)**2
+        self.rec = 2 * jnp.pi * jnp.linalg.inv(self.lattice)
+        self.volume = jnp.abs(jnp.linalg.det(lattice))
+        self.gamma = (2.8 / self.volume**(1/3)) ** 2
         
         ordinals = sorted(range(-truncationLimit, truncationLimit + 1), key=abs)
         ordinals = jnp.array(list(itertools.product(ordinals, repeat=3)))
         
-        self.lat_vectors = L * ordinals
+        self.lat_vectors = jnp.einsum('kj,ij->ik', self.lattice, ordinals)
         lat_vec_norm = jnp.linalg.norm(self.lat_vectors[1:], axis=-1)
         
-        rec_scale = 2 * jnp.pi / L
-        self.rec_vectors = rec_scale * ordinals[1:]
-        self.rec_vec_square = jnp.sum(self.rec_vectors**2., axis=1)
+        self.rec_vectors = jnp.einsum('jk,ij->ik', self.rec, ordinals[1:])
+        self.rec_vec_square = jnp.einsum('ij,ij->i', self.rec_vectors, self.rec_vectors)
                 
         self.madelung_const = (
             jnp.sum(jax.scipy.special.erfc(jnp.sqrt(self.gamma) * lat_vec_norm) / lat_vec_norm)
@@ -101,11 +101,13 @@ class EwaldPotential(LocalEnergy):
                 jnp.pi / (self.volume * self.gamma)
 
     def configuration(self, parameters, rs):
-        ee = rs[:, None, :] - rs[None, :, :]
-        ee = (ee + 0.5 * self.L) % self.L - 0.5 * self.L
         N = rs.shape[0]
-        flat = ee.reshape(-1, 3)
-        vals = self.batch_ewald_sum(flat).reshape(N,N)
+        ee = rs[:, None, :] - rs[None, :, :]
+        phase_ee = jnp.einsum('il,jkl->jki', self.rec / (2 * jnp.pi), ee)
+        phase_prim_ee = phase_ee % 1
+        prim_ee = jnp.einsum('il,jkl->jki', self.lattice, phase_prim_ee)
+        prim_ee = prim_ee.reshape(-1, 3)
+        vals = self.batch_ewald_sum(prim_ee).reshape(N,N)
         vals = vals.at[jnp.diag_indices(N)].set(0.0)
         return 0.5 * jnp.sum(vals) + 0.5 * N * self.madelung_const
 
@@ -117,23 +119,23 @@ class EwaldPotential2D(LocalEnergy):
     in 2 Dimensions.
     """
     
-    def __init__(self, L, truncationLimit=2):
-        
-        self.L = L
+    def __init__(self, lattice, truncationLimit=2):
+
+        self.lattice = lattice
         self.truncationLimit = truncationLimit
         
-        self.area = L**2
-        self.gamma = (2.8 / L)**2
+        self.rec = 2 * jnp.pi * jnp.linalg.inv(self.lattice)
+        self.area = jnp.abs(jnp.linalg.det(lattice))
+        self.gamma = (2.8 / self.area**(1/2)) ** 2
         
         ordinals = sorted(range(-truncationLimit, truncationLimit + 1), key=abs)
         ordinals = jnp.array(list(itertools.product(ordinals, repeat=2)))
         
-        self.lat_vectors = L * ordinals
+        self.lat_vectors = jnp.einsum('kj,ij->ik', self.lattice, ordinals)
         lat_vec_norm = jnp.linalg.norm(self.lat_vectors[1:], axis=-1)
         
-        rec_scale = 2 * jnp.pi / L
-        self.rec_vectors = rec_scale * ordinals[1:]
-        self.rec_vec_square = jnp.sum(self.rec_vectors**2., axis=1)
+        self.rec_vectors = jnp.einsum('jk,ij->ik', self.rec, ordinals[1:])
+        self.rec_vec_square = jnp.einsum('ij,ij->i', self.rec_vectors, self.rec_vectors)
         self.rec_vec_norm = jnp.sqrt(self.rec_vec_square)
                 
         self.madelung_const = (
@@ -161,19 +163,21 @@ class EwaldPotential2D(LocalEnergy):
                 2 * jnp.sqrt(jnp.pi) / (self.area * jnp.sqrt(self.gamma))
 
     def configuration(self, parameters, rs):
-        ee = rs[:, None, :] - rs[None, :, :]
-        ee = (ee + 0.5 * self.L) % self.L - 0.5 * self.L
         N = rs.shape[0]
-        flat = ee.reshape(-1, 2)
-        vals = self.batch_ewald_sum(flat).reshape(N,N)
+        ee = rs[:, None, :] - rs[None, :, :]
+        phase_ee = jnp.einsum('il,jkl->jki', self.rec / (2 * jnp.pi), ee)
+        phase_prim_ee = phase_ee % 1
+        prim_ee = jnp.einsum('il,jkl->jki', self.lattice, phase_prim_ee)
+        prim_ee = prim_ee.reshape(-1, 2)
+        vals = self.batch_ewald_sum(prim_ee).reshape(N,N)
         vals = vals.at[jnp.diag_indices(N)].set(0.0)
         return 0.5 * jnp.sum(vals) + 0.5 * N * self.madelung_const
 
 class LocalEnergyUEG(LocalEnergy):
 
-    def __init__(self, logWavefunction, L, truncationLimit=2):
+    def __init__(self, logWavefunction, lattice, truncationLimit=2):
         self.kineticEnergy = LocalKineticEnergy(logWavefunction)
-        self.potentialEnergy = EwaldPotential(L, truncationLimit)
+        self.potentialEnergy = EwaldPotential(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
         kineticEnergy = self.kineticEnergy.configuration(parameters, rs)
@@ -182,9 +186,9 @@ class LocalEnergyUEG(LocalEnergy):
 
 class LocalEnergyUEG2D(LocalEnergy):
 
-    def __init__(self, logWavefunction, L, truncationLimit=2):
+    def __init__(self, logWavefunction, lattice, truncationLimit=2):
         self.kineticEnergy = LocalKineticEnergy(logWavefunction)
-        self.potentialEnergy = EwaldPotential2D(L, truncationLimit)
+        self.potentialEnergy = EwaldPotential2D(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
         kineticEnergy = self.kineticEnergy.configuration(parameters, rs)

@@ -33,19 +33,6 @@ def computeRws(N, L, dim):
     else:
         raise Exception("Only dim=2 or dim=3 are supported.")
 
-class Wavefunction(nn.Module):
-    """
-    Defines batched functions based on single-walker functions. This way you
-    only need to define single-walker initialize and forward pass functions
-    when defining wavefunctions.
-    """
-    def initBatch(self, rng, walkerRs):
-        return self.init(rng, walkerRs[0,:,:])
-    
-    def applyBatch(self, parameters, walkerRs):
-        vmapApply = jax.vmap(self.apply, in_axes=(None,0))
-        return vmapApply(parameters, walkerRs)
-
 def saveParameters(filename, parameters):
     """
     Saves a pytree object that contains a wavefunction's parameters.
@@ -62,37 +49,6 @@ def loadParameters(filename):
     with open(filename, "rb") as f:
         parameters = from_bytes(FrozenDict, f.read())
     return parameters
-
-def genKpoints(N, L, dim):
-    """
-    Generate as many k-points as needed to represent N electrons in a cubic box
-    with side length L. To make jax happy, we always return exactly N k-points,
-    even if that doesn't lead to a full outer shell.
-    
-    NOTE: This code is a (only slightly) modified version of code taken from
-    FermiNet! The original code is from the `make_kpoints` function from
-    `ferminet/pbc/envelopes.py`.
-    """
-
-    if not (dim == 2 or dim == 3):
-        raise Exception("Only dim=2 or dim=3 are supported.")
-    
-    recUnitVectorLength = 2 * jnp.pi / L
-    
-    dk = 1 + 1e-5
-    
-    max_k = int((N * dk)**(1/dim) + 0.5)
-    ordinals = sorted(range(-max_k, max_k+1), key=abs)
-    ordinals = jnp.array(list(itertools.product(ordinals, repeat=dim)))
-    
-    kpoints = ordinals * recUnitVectorLength
-    kpointsOrder = jnp.argsort(jnp.linalg.norm(kpoints, axis=1))
-    kpoints = kpoints[kpointsOrder]
-    kNorms = jnp.linalg.norm(kpoints, axis=1)
-    
-    thresholdValue = kNorms[N-1] * dk
-    chosenKpoints = kpoints[:N,:]
-    return chosenKpoints
 
 def testAntisymmetry(wavefunction, parameters, rs, tol=1e-6):
     """
@@ -139,26 +95,115 @@ def testAntisymmetry(wavefunction, parameters, rs, tol=1e-6):
 
     return True
 
+class Wavefunction(nn.Module):
+    """
+    Defines batched functions based on single-walker functions. This way you
+    only need to define single-walker initialize and forward pass functions
+    when defining wavefunctions.
+    """
+    def initBatch(self, rng, walkerRs):
+        return self.init(rng, walkerRs[0,:,:])
+    
+    def applyBatch(self, parameters, walkerRs):
+        vmapApply = jax.vmap(self.apply, in_axes=(None,0))
+        return vmapApply(parameters, walkerRs)
+
+def genKpoints(N, lattice, dim):
+    """
+    Generates N k-points sorted by energy, ensuring +/- k pairs are adjacent.
+    
+    Sequence: [0, k1, -k1, k2, -k2, ...]
+    
+    Args:
+        N: Number of k-points required.
+        lattice: (dim, dim) numpy array (real space lattice vectors).
+        dim: 2 or 3.
+    """
+    # Force lattice to concrete numpy for static integer generation
+    lattice = np.array(lattice)
+    
+    if not (dim == 2 or dim == 3):
+        raise ValueError("Only dim=2 or dim=3 are supported.")
+    
+    # 1. Reciprocal Lattice
+    rec_lattice = 2 * np.pi * np.linalg.inv(lattice).T
+    rec_norms = np.linalg.norm(rec_lattice, axis=1)
+
+    # 2. Estimate Integer Bounds (with safety factor for anisotropy)
+    vol_k_cell = np.abs(np.linalg.det(rec_lattice))
+    
+    if dim == 2:
+        k_radius = (N * vol_k_cell / np.pi)**0.5
+    else:
+        k_radius = (N * vol_k_cell * 3 / (4 * np.pi))**(1.0/3.0)
+        
+    # Safety factor of 1.5 + buffer to handle anisotropic boxes
+    max_integers = np.ceil(1.5 * k_radius / rec_norms).astype(int) + 2
+    
+    # 3. Generate Integer Grid
+    ranges = [range(-m, m+1) for m in max_integers]
+    int_candidates = np.array(list(itertools.product(*ranges)))
+    
+    # 4. Sort Candidates by PHYSICAL Norm
+    phys_k = int_candidates @ rec_lattice
+    norms = np.linalg.norm(phys_k, axis=1)
+    
+    # Sort indices based on energy (norm)
+    sorted_indices = np.argsort(norms)
+    candidates_sorted = int_candidates[sorted_indices]
+    
+    # 5. Selection Loop with +/- Pairing
+    selected_ints = []
+    seen_hashes = set()
+    
+    for k_vec in candidates_sorted:
+        if len(selected_ints) >= N:
+            break
+            
+        # Use tuple for efficient set lookup
+        k_tuple = tuple(k_vec)
+        
+        if k_tuple in seen_hashes:
+            continue
+            
+        # Found a new lowest-energy vector. Add it.
+        selected_ints.append(k_vec)
+        seen_hashes.add(k_tuple)
+        
+        # If we still need points, immediately try to add -k
+        if len(selected_ints) < N:
+            neg_k_vec = -k_vec
+            neg_k_tuple = tuple(neg_k_vec)
+            
+            # Add -k if it hasn't been added (and isn't 0)
+            if neg_k_tuple not in seen_hashes:
+                selected_ints.append(neg_k_vec)
+                seen_hashes.add(neg_k_tuple)
+                
+    # 6. Final Conversion to Physical Vectors
+    selected_ints = np.array(selected_ints)
+    chosenKpoints = selected_ints @ rec_lattice
+    
+    return jnp.array(chosenKpoints)
+
 class LogSimpleSlater(Wavefunction):
     """
     Creates a log-wavefunction that is just a simple Slater determinant of the
-    input electron coordinates. The basis for the determinant is the lowest N
-    k-points that satisfy periodic boundary conditions for the specified box
-    length L (refer to `genKpoints`).
+    input electron coordinates. The basis for the determinant is specified by
+    the provided kpoints.
     
     NOTE: These determinants use the convention that different particle
     positions are in different rows. Columns correspond to plane wave orbitals.
     """
     N : int
-    L : float
     dim : int
+    kpoints : jnp.ndarray
 
     def setup(self):
         
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
             
-        self.kpoints = genKpoints(self.N, self.L, dim=self.dim)
         weights = 10.0 ** jnp.arange(1, self.dim + 1)
         weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
         k_signs = jnp.sign(weighted_sums + 1.0)
@@ -262,12 +307,12 @@ class LogSimpleSlaters(Wavefunction):
     There are 2 variational parameters, both in the Jastrow.
     """
     spins : (int,int)
-    L : float
     dim : int
+    kpoints : jnp.ndarray
 
     def setup(self):
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L, dim=self.dim)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L, dim=self.dim)
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
 
     def __call__(self, rs):
         slaterUp = self.slaterUp(rs[:self.spins[0],:])
