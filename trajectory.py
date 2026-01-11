@@ -86,30 +86,83 @@ class MALAUpdater:
         rngs = jax.random.split(rng, walkers)
         return self.updateWalkers(parameters, rs, rngs, tau)
 
-def wignerCrystal(spins, r_ws, L, walkers, rng, dim=3):
+def wignerCrystal(spins, lattice, walkers, rng, dim=3, gridShape=None):
+    """
+    Generates a Wigner Crystal initial guess for arbitrary unit cells.
     
-    N = spins[0] + spins[1]
+    Args:
+        spins: Tuple (n_up, n_down)
+        lattice: (dim, dim) matrix where rows are lattice vectors.
+                 e.g. [[Lx, 0], [Tx, Ty]]
+        walkers: Number of walkers to generate
+        rng: JAX random key
+        dim: 2 or 3
+        gridShape: specifies number of grid points along each dimension
+    """
+    
     NUp = spins[0]
     NDown = spins[1]
 
-    numLatticePoints = jnp.ceil(jnp.maximum(NUp, NDown) ** (1/3))
-    points = jnp.linspace(0, L, int(numLatticePoints), endpoint=False)
-    shift = L / numLatticePoints / 2
-    
-    grids = jnp.meshgrid(*([points]*dim), indexing="ij")
-    upPositions = jnp.stack(grids, axis=-1).reshape(-1, dim)
-    downPositions = (upPositions + shift)
-    
-    singleWalker = jnp.concatenate([
-        upPositions[:NUp], downPositions[:NDown]
-    ], axis=0)
+    if dim == 2:
+        
+        # STRIPED TRIANGULAR PHASE
+
+        if gridShape is None:
+            n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
+            n_side_x = n_side
+            n_side_y = n_side
+        else:
+            ( n_side_x , n_side_y ) = gridShape
+            
+        x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
+        y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
+        
+        xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
+        frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
+        
+        dx = 1.0 / n_side_x
+        dy = 1.0 / n_side_y
+        
+        shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
+        
+        frac_down = (frac_up + shift_vec) % 1.0
+        
+        upPositions = frac_up @ lattice
+        downPositions = frac_down @ lattice
+        
+        singleWalker = jnp.concatenate([
+            upPositions[:NUp], downPositions[:NDown]
+        ], axis=0)
+
+    elif dim == 3:
+        
+        # BCC-LIKE LATTICE
+        
+        numLatticePoints = int(jnp.ceil(jnp.maximum(NUp, NDown) ** (1/3)))
+        
+        points = jnp.linspace(0, 1, numLatticePoints, endpoint=False)
+        
+        grids = jnp.meshgrid(*([points]*dim), indexing="ij")
+        frac_up = jnp.stack(grids, axis=-1).reshape(-1, dim)
+        
+        frac_shift = (1.0 / numLatticePoints) / 2.0
+        frac_down = (frac_up + frac_shift) % 1.0
+        
+        upPositions = frac_up @ lattice
+        downPositions = frac_down @ lattice
+        
+        singleWalker = jnp.concatenate([
+            upPositions[:NUp], downPositions[:NDown]
+        ], axis=0)
+
+    else:
+        raise Exception("Only dim=2 or dim=3 are supported.")
+
     allWalkers = jnp.broadcast_to(
         singleWalker, (walkers,) + singleWalker.shape
     )
-
-    noise = (r_ws / 10) * jax.random.normal(rng, shape=allWalkers.shape)
-
-    return allWalkers # + noise
+    
+    return allWalkers
 
 def acceptanceArray(rs1, rs2):
     """

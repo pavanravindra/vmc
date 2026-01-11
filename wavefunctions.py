@@ -12,26 +12,57 @@ import numpy as np
 
 import itertools
 
-def computeL(N, r_ws, dim):
-    if dim == 2:
-        area = jnp.pi * (r_ws ** 2) * N
-        L = jnp.sqrt(area)
-        return L
-    elif dim == 3:
-        n = 3. / (4. * jnp.pi * (r_ws ** 3.))
-        V = N / n
-        L = V ** (1./3.)
-        return L
-    else:
-        raise Exception("Only dim=2 or dim=3 are supported.")
+def computeLattice(N, r_ws, dim, basis_matrix=None):
+    """
+    Computes the scaled lattice matrix for a given number of particles and
+    Wigner-Seitz radius.
 
-def computeRws(N, L, dim):
+    Args:
+        N: Number of particles.
+        r_ws: Wigner-Seitz radius (r_s).
+        dim: 2 or 3.
+        basis_matrix: (dim, dim) Optional template lattice. 
+                      If None, defaults to the identity (cubic/square).
+                      The output will be this matrix scaled to match the 
+                      target density.
+    """
     if dim == 2:
-        return  L / jnp.sqrt(jnp.pi * N)
+        target_vol = jnp.pi * (r_ws ** 2) * N
     elif dim == 3:
-        return L * (3. / (4. * jnp.pi * N)) ** (1./3.)
+        target_vol = (4.0 / 3.0) * jnp.pi * (r_ws ** 3) * N
     else:
-        raise Exception("Only dim=2 or dim=3 are supported.")
+        raise ValueError("Only dim=2 or dim=3 are supported.")
+
+    if basis_matrix is None:
+        basis_matrix = jnp.eye(dim)
+        template_vol = 1.0
+    else:
+        basis_matrix = jnp.array(basis_matrix)
+        template_vol = jnp.abs(jnp.linalg.det(basis_matrix))
+
+    scale = (target_vol / template_vol) ** (1.0 / dim)
+
+    return basis_matrix * scale
+
+
+def computeRws(N, lattice, dim):
+    """
+    Computes the effective Wigner-Seitz radius for a given lattice and 
+    particle count.
+
+    Args:
+        N: Number of particles.
+        lattice: (dim, dim) array defining the simulation cell.
+        dim: 2 or 3.
+    """
+    vol = jnp.abs(jnp.linalg.det(lattice))
+    
+    if dim == 2:
+        return jnp.sqrt(vol / (jnp.pi * N))
+    elif dim == 3:
+        return (vol / (N * (4.0 / 3.0) * jnp.pi)) ** (1.0 / 3.0)
+    else:
+        raise ValueError("Only dim=2 or dim=3 are supported.")
 
 def saveParameters(filename, parameters):
     """
@@ -225,30 +256,24 @@ class LogSimpleSlater(Wavefunction):
         slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
         return jnp.linalg.slogdet(slaterMatrix)[1]
 
-def coulombYukawa(r, A, F, L):
+def coulombYukawa(r_real, r_frac, A, F):
     """
-    Coulomb-Yukawa two-body Jastrow function. Also has a decay term so that the
-    Jastrow appropriately dies off before the boundary.
-
+    Coulomb-Yukawa Jastrow with anisotropic Decay.
+    
+    Args:
+        r_real: The physical distance (for the Coulomb/Yukawa interaction).
+        r_frac: The norm of the fractional distance vector. 
+                This is used to make sure the Jastrow dies at the unit cell
+                boundaries.
     """
-    cy = (A/r) * (1 - jnp.exp(-r/F))
-    r_cut = L/2
-    x = jnp.clip(r / r_cut, a_min=0.0, a_max=1.0-1e-5)
+    r_safe = jnp.where(r_real < 1e-12, 1.0, r_real) 
+    cy = (A / r_safe) * (1 - jnp.exp(-r_safe / F))
+    
+    r_cut_frac = 0.5
+    x = jnp.clip(r_frac / r_cut_frac, a_min=0.0, a_max=1.0 - 1e-5)
     decay = jnp.exp(1 - 1 / (1 - x**2))
+    
     return cy * decay
-
-def getOffDiagonalFlat(x):
-    """
-    Given an NxN matrix `x`, returns a (N*(N-1),) jnp array with only the
-    off-diagonal elements of `x`.
-    """
-    N = x.shape[0]
-    i = jnp.arange(N)
-    row = jnp.repeat(i, N-1)
-    col = jnp.concatenate([
-        jnp.concatenate([jnp.arange(j), jnp.arange(j+1, N)]) for j in range(N)
-    ])
-    return x[row, col]
 
 class LogCYJastrow(Wavefunction):
     """
@@ -263,41 +288,55 @@ class LogCYJastrow(Wavefunction):
     optimization, the resulting wavefunction remains physical.
     """
     spins : (int,int)
-    L : float
+    lattice: jnp.ndarray
 
     def setup(self):
 
         N = self.spins[0] + self.spins[1]
-        n = N / (self.L**3.)
+        volume = jnp.abs(jnp.linalg.det(self.lattice))
+        n = N / volume
+
+        self.rec_lattice = jnp.linalg.inv(self.lattice)
 
         self.As = self.param(
             "As_same_diff",
-            lambda rng : jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
+            lambda rng: jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
         )
 
     def __call__(self, rs):
+
+        N = rs.shape[0]
 
         A_same = jnp.abs(self.As[0])
         A_diff = jnp.abs(self.As[1])
         
         F_same = jnp.sqrt(2 * A_same)
         F_diff = jnp.sqrt(A_diff)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
 
-        same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
-        same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
-        sameDists = jnp.concatenate([same_up, same_down])
-        sameCY = coulombYukawa(sameDists, A_same, F_same, self.L)
-        
-        diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
-        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
+        disp_real_raw = rs[:,None,:] - rs[None,:,:]
+        disp_frac = jnp.dot(disp_real_raw, self.rec_lattice)
+        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
+        disp_real_mic = jnp.dot(disp_frac, self.lattice)
 
-        return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
+        eye_mask = jnp.eye(N)[:,:,None]
+        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
+        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
+        
+        n_up, n_down = self.spins
+        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
+        
+        mask_same = spin_mask[:,None] == spin_mask[None,:]
+        mask_diff = spin_mask[:,None] != spin_mask[None,:]
+        eye = jnp.eye(N, dtype=bool)
+        mask_same = mask_same & (~eye)
+        
+        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
+        val_same = jnp.where(mask_same, val_same, 0.0)
+
+        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
+        val_diff = jnp.where(mask_diff, val_diff, 0.0)
+
+        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
 
 class LogSimpleSlaters(Wavefunction):
     """
@@ -327,12 +366,14 @@ class LogSlaterCYJastrow(Wavefunction):
     There are 2 variational parameters, both in the Jastrow.
     """
     spins : (int,int)
-    L : float
+    dim : int
+    lattice: jnp.ndarray
+    kpoints : jnp.ndarray
 
     def setup(self):
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
 
     def __call__(self, rs):
         slaterUp = self.slaterUp(rs[:self.spins[0],:])
@@ -342,20 +383,27 @@ class LogSlaterCYJastrow(Wavefunction):
 
 class LogTwoBodySJ(Wavefunction):
     """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: RHF ground state
-    - Jastrow: Coulomb-Yukawa + neural function acting on pairwise information
-        NOTE: This basically comes up with the "best" two-body Jastrow.
+    Two-Body Slater-Jastrow wavefunction for arbitrary (skewed) periodic cells.
+    
+    Args:
+        lattice: (D, D) matrix defining the lattice vectors (rows).
+                 e.g. [[Lx, 0], [Tx, Ty]] for a 2D tilted cell.
+        kpoints: (N, D) matrix with the occupied k-points for the Slater
+                 determinant.
     """
     spins : (int,int)
-    L : float
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
     hiddenFeatures : int
 
     def setup(self):
+
+        N = self.spins[0] + self.spins[1]
         
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
         
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
         self.linearSelf2 = nn.Dense(1)
@@ -370,11 +418,13 @@ class LogTwoBodySJ(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
 
-        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
+        recLattice = jnp.linalg.inv(self.lattice)
+        fracDisps = disps @ recLattice
+
+        cosDisps = jnp.cos(2 * jnp.pi * fracDisps)
+        sinDisps = jnp.sin(2 * jnp.pi * fracDisps)
         sinDispsMag = jnp.linalg.norm(
-            jnp.sin(jnp.pi * disps / self.L),
-            axis=-1, keepdims=True
+            jnp.sin(jnp.pi * fracDisps), axis=-1, keepdims=True
         )
         sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
         
@@ -395,28 +445,34 @@ class LogTwoBodySJ(Wavefunction):
 
 class LogTwoBodySJB(Wavefunction):
     """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: RHF ground state
-    - Jastrow: Coulomb-Yukawa + neural function acting on pairwise information
-        NOTE: This basically comes up with the "best" two-body Jastrow.
-    - Backflow: acts purely on pairwise information to produce arbitrary
-                backflow coordinates
+    Two-Body Slater-Jastrow-Backflow wavefunction for arbitrary (skewed)
+    periodic cells.
+    
+    Args:
+        lattice: (D, D) matrix defining the lattice vectors (rows).
+                 e.g. [[Lx, 0], [Tx, Ty]] for a 2D tilted cell.
+        kpoints: (N, D) matrix with the occupied k-points for the Slater
+                 determinant.
     """
     spins : (int,int)
-    L : float
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
     hiddenFeatures : int
 
     def setup(self):
+
+        N = self.spins[0] + self.spins[1]
         
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
         
         self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
         self.neuralJastrow2 = nn.Dense(1)
         
         self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
-        self.neuralBackflow2 = nn.Dense(3)
+        self.neuralBackflow2 = nn.Dense(self.dim)
 
     def __call__(self, rs):
         
@@ -426,11 +482,13 @@ class LogTwoBodySJB(Wavefunction):
         mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
         disps = jnp.where(mask, disps, 0.0)
 
-        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
+        recLattice = jnp.linalg.inv(self.lattice)
+        fracDisps = disps @ recLattice
+
+        cosDisps = jnp.cos(2 * jnp.pi * fracDisps)
+        sinDisps = jnp.sin(2 * jnp.pi * fracDisps)
         sinDispsMag = jnp.linalg.norm(
-            jnp.sin(jnp.pi * disps / self.L),
-            axis=-1, keepdims=True
+            jnp.sin(jnp.pi * fracDisps), axis=-1, keepdims=True
         )
         sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
         

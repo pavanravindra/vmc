@@ -341,7 +341,7 @@ class ueg_qc(ueg):
     def unitary_pw_to_real(self, k_points: jax.Array) -> jax.Array:
         n_kpts = k_points.shape[0]
         assert (n_kpts - 1) % 2 == 0, "k_points must be Gamma + pairs."
-        U = jnp.zeros((n_kpts, n_kpts), dtype=jnp.complex128)
+        U = jnp.zeros((n_kpts, n_kpts), dtype=jnp.complex64)
         block = jnp.array([[1.0, 1.0], [-1.0j, 1.0j]]) / jnp.sqrt(2.0)
         n_blocks = (n_kpts - 1) // 2
         U = U.at[0, 0].set(1.0)
