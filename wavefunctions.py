@@ -516,6 +516,121 @@ class LogTwoBodySJB(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
+class LogMPSlater(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Slater determinant built from a
+    multiple planewave basis.
+    """
+    N : int
+    dim : int
+    kpoints : jnp.ndarray
+
+    def setup(self):
+        
+        if not (self.dim == 2 or self.dim == 3):
+            raise Exception("Only dim=2 or dim=3 are supported.")
+
+        self.numKpoints = self.kpoints.shape[0]
+        weights = 10.0 ** jnp.arange(1, self.dim + 1)
+        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
+        k_signs = jnp.sign(weighted_sums + 1.0)
+        self.cos_switch = (k_signs + 1.0) / 2.0
+        self.sin_switch = (1.0 - k_signs) / 2.0
+
+        self.mp_coeffs = self.param(
+            "MP_coefficients",
+            lambda rng:
+            jnp.eye(self.numKpoints, self.N) +
+            5e-2 * jax.random.normal(rng, shape=(self.numKpoints, self.N))
+        )
+
+    def __call__(self, rs):
+        def makeBasisRow(ri):
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                return c_switch * jnp.cos(dot_val) + s_switch * jnp.sin(-dot_val)
+            terms = jax.vmap(localKpointFunction)(
+                self.kpoints, self.cos_switch, self.sin_switch
+            )
+            return terms
+        basisMatrix = jax.vmap(makeBasisRow)(rs)
+        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)
+        return jnp.linalg.slogdet(orbitalMatrix)[1]
+
+class LogMPTwoBodySJB(Wavefunction):
+    """
+    Two-Body Slater-Jastrow-Backflow wavefunction for arbitrary (skewed)
+    periodic cells. The Slater determinant consists of a sum of multiple
+    planewaves.
+    
+    Args:
+        lattice: (D, D) matrix defining the lattice vectors (rows).
+                 e.g. [[Lx, 0], [Tx, Ty]] for a 2D tilted cell.
+        kpoints: (N_k, D) matrix with the k-points that make up the basis
+                 for the Slater determinant.
+    """
+    spins : (int,int)
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
+    hiddenFeatures : int
+
+    def setup(self):
+
+        N = self.spins[0] + self.spins[1]
+        
+        self.slaterUp = LogMPSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogMPSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
+        
+        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralJastrow2 = nn.Dense(1)
+        
+        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
+        self.neuralBackflow2 = nn.Dense(self.dim)
+
+    def __call__(self, rs):
+        
+        CYJastrow = self.CYJastrow(rs)
+        
+        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
+        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+        disps = jnp.where(mask, disps, 0.0)
+
+        recLattice = jnp.linalg.inv(self.lattice)
+        fracDisps = disps @ recLattice
+
+        cosDisps = jnp.cos(2 * jnp.pi * fracDisps)
+        sinDisps = jnp.sin(2 * jnp.pi * fracDisps)
+        sinDispsMag = jnp.linalg.norm(
+            jnp.sin(jnp.pi * fracDisps), axis=-1, keepdims=True
+        )
+        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
+        
+        N = self.spins[0] + self.spins[1]
+        electronIdxs = jnp.arange(N)
+        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
+        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
+        
+        v_ij = jnp.concatenate(
+            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
+            axis=-1
+        )
+        
+        selfTerm = self.neuralJastrow2(nn.swish(self.neuralJastrow1(v_ij)))
+        neuralJastrow = jnp.average(selfTerm)
+
+        backflow = jnp.average(
+            self.neuralBackflow2(nn.swish(self.neuralBackflow1(v_ij))),
+            axis=1
+        )
+        xs = rs + backflow
+        
+        slaterUp = self.slaterUp(xs[:self.spins[0],:])
+        slaterDown = self.slaterDown(xs[self.spins[0]:,:])
+        
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
+
 class LogMessagePassingSJB(Wavefunction):
     """
     Slater-Jastrow wavefunction with following specs:
