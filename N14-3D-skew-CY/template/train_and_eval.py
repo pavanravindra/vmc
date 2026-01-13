@@ -41,7 +41,7 @@ spins = ( NUp , NDown )
 
 lattice = wavefunctions.computeLattice(
     N, r_ws, dim,
-    basis_matrix=jnp.eye(dim)
+    basis_matrix=jnp.eye(dim) + 0.2
 )
 kpoints = wavefunctions.genKpoints(jnp.maximum(NUp, NDown), lattice, dim)
 

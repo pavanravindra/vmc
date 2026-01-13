@@ -72,7 +72,7 @@ eta0 = hyperparameters[0]
 #   Creating wavefunction, walker updater, optimizer, and local energy        #
 ###############################################################################
 
-wavefunction = wavefunctions.LogSlaterCYJastrow(spins, dim, lattice, kpoints)
+wavefunction = wavefunctions.LogTwoBodySJB(spins, dim, lattice, kpoints, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 if dim == 2:
     localEnergy = hamiltonian.LocalEnergyUEG2D(wavefunction, lattice)

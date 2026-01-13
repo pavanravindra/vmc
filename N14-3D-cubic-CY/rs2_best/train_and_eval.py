@@ -23,7 +23,7 @@ start = time.time()
 #   Settings for whole simulation                                             #
 ###############################################################################
 
-r_ws = xxxRSxxx
+r_ws = 2
 N = 14
 tau = 1.25
 dim = 3
@@ -58,7 +58,7 @@ diagonalShift = 1e-3
 if not os.path.exists("hyperparameters.txt"):
     
     hyperparameters = np.full(1, np.nan)
-    hyperparameters[0] = optimization.logSample(xxxLRMIN0xxx,xxxLRMAX0xxx)
+    hyperparameters[0] = optimization.logSample(1e-4,5e2)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)

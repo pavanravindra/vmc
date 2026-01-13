@@ -24,9 +24,9 @@ start = time.time()
 ###############################################################################
 
 r_ws = xxxRSxxx
-N = 14
+N = 10
 tau = 1.25
-dim = 3
+dim = 2
 
 walkers = 1024
 
@@ -41,7 +41,7 @@ spins = ( NUp , NDown )
 
 lattice = wavefunctions.computeLattice(
     N, r_ws, dim,
-    basis_matrix=jnp.eye(dim)
+    basis_matrix=jnp.eye(dim) + 0.2
 )
 kpoints = wavefunctions.genKpoints(jnp.maximum(NUp, NDown), lattice, dim)
 
@@ -72,7 +72,7 @@ eta0 = hyperparameters[0]
 #   Creating wavefunction, walker updater, optimizer, and local energy        #
 ###############################################################################
 
-wavefunction = wavefunctions.LogSlaterCYJastrow(spins, dim, lattice, kpoints)
+wavefunction = wavefunctions.LogTwoBodySJB(spins, dim, lattice, kpoints, 16)
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 if dim == 2:
     localEnergy = hamiltonian.LocalEnergyUEG2D(wavefunction, lattice)
