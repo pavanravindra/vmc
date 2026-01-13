@@ -86,7 +86,7 @@ class MALAUpdater:
         rngs = jax.random.split(rng, walkers)
         return self.updateWalkers(parameters, rs, rngs, tau)
 
-def wignerCrystal(spins, lattice, walkers, rng, dim=3, gridShape=None):
+def wignerCrystal(spins, lattice, r_ws, walkers, rng, dim=3, gridShape=None):
     """
     Generates a Wigner Crystal initial guess for arbitrary unit cells.
     
@@ -94,6 +94,7 @@ def wignerCrystal(spins, lattice, walkers, rng, dim=3, gridShape=None):
         spins: Tuple (n_up, n_down)
         lattice: (dim, dim) matrix where rows are lattice vectors.
                  e.g. [[Lx, 0], [Tx, Ty]]
+        r_ws : Wigner-Seitz radius (used to determine magnitude of noise)
         walkers: Number of walkers to generate
         rng: JAX random key
         dim: 2 or 3
@@ -161,8 +162,9 @@ def wignerCrystal(spins, lattice, walkers, rng, dim=3, gridShape=None):
     allWalkers = jnp.broadcast_to(
         singleWalker, (walkers,) + singleWalker.shape
     )
+    noise = jax.random.normal(rng, allWalkers.shape) * r_ws * 0.01
     
-    return allWalkers
+    return allWalkers + noise
 
 def acceptanceArray(rs1, rs2):
     """
