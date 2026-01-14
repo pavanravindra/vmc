@@ -541,7 +541,7 @@ class LogMPSlater(Wavefunction):
             "MP_coefficients",
             lambda rng:
             jnp.eye(self.numKpoints, self.N) +
-            5e-2 * jax.random.normal(rng, shape=(self.numKpoints, self.N))
+            1e-6 * jax.random.normal(rng, shape=(self.numKpoints, self.N))
         )
 
     def __call__(self, rs):
