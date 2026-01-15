@@ -516,6 +516,58 @@ class LogTwoBodySJB(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
+def uhfInitialization(spins, dim, lattice, kpoints, seed=558):
+    """
+    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
+    `numkPoints` specifies the number of k-points to use in the planewave
+    basis for UHF.
+
+    Returns the k-points used in the planewave basis and the UHF ground state
+    coefficients for both spin-up and spin-down electrons.
+
+    The coefficient matrices are of shape (K,N) where K is the number of
+    planewaves and N is the number of particles of each spin.
+    """
+    
+    np.random.seed(seed)
+    
+    system = qc.ueg_qc(0, spins, dim=dim, e_cut_red=0, basis=lattice)
+    numkPoints = kpoints.shape[0]
+    h1 = system.get_h1(kpoints)
+    eri_jax = system.get_eri_tensor_real(kpoints)
+    eri = np.asarray(eri_jax, dtype=np.double)
+    
+    mol = gto.M(verbose=0)
+    mol.nelectron = system.n_particles
+    mol.incore_anyway = True
+    mol.energy_nuc = lambda *args: 0.0
+    
+    umf = scf.UHF(mol)
+    umf.max_cycle = 200
+    umf.get_hcore = lambda *args: [h1, h1]
+    umf.get_ovlp = lambda *args: np.eye(numkPoints)
+    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
+    
+    dm0 = umf.get_init_guess()
+    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
+    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
+    umf.level_shift = 0.4
+
+    umf.kernel(dm0)
+    
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    umf.stability(external=False)
+
+    energy = umf.e_tot
+    kpoints = jnp.array(kpoints)
+    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
+    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
+
+    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
+
 class LogMPSlater(Wavefunction):
     """
     Creates a log-wavefunction that is a Slater determinant built from a
@@ -524,6 +576,7 @@ class LogMPSlater(Wavefunction):
     N : int
     dim : int
     kpoints : jnp.ndarray
+    init_coeffs : jnp.ndarray
 
     def setup(self):
         
@@ -538,10 +591,7 @@ class LogMPSlater(Wavefunction):
         self.sin_switch = (1.0 - k_signs) / 2.0
 
         self.mp_coeffs = self.param(
-            "MP_coefficients",
-            lambda rng:
-            jnp.eye(self.numKpoints, self.N) +
-            1e-6 * jax.random.normal(rng, shape=(self.numKpoints, self.N))
+            "MP_coefficients", lambda rng: self.init_coeffs
         )
 
     def __call__(self, rs):
@@ -573,14 +623,16 @@ class LogMPTwoBodySJB(Wavefunction):
     dim : int
     lattice : jnp.ndarray
     kpoints : jnp.ndarray
+    upCoeffs : jnp.ndarray
+    downCoeffs : jnp.ndarray
     hiddenFeatures : int
 
     def setup(self):
 
         N = self.spins[0] + self.spins[1]
         
-        self.slaterUp = LogMPSlater(self.spins[0], self.dim, self.kpoints)
-        self.slaterDown = LogMPSlater(self.spins[1], self.dim, self.kpoints)
+        self.slaterUp = LogMPSlater(self.spins[0], self.dim, self.kpoints, self.upCoeffs)
+        self.slaterDown = LogMPSlater(self.spins[1], self.dim, self.kpoints, self.downCoeffs)
         self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
         
         self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
@@ -937,58 +989,6 @@ class LogMessagePassingSJBLayerNorm(Wavefunction):
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
 
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
-
-def uhfInitialization(r_ws, spins, numkPoints, seed=558):
-    """
-    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
-    `numkPoints` specifies the number of k-points to use in the planewave
-    basis for UHF.
-
-    Returns the k-points used in the planewave basis and the UHF ground state
-    coefficients for both spin-up and spin-down electrons.
-
-    The coefficient matrices are of shape (K,N) where K is the number of
-    planewaves and N is the number of particles of each spin.
-    """
-    
-    np.random.seed(seed)
-    
-    system = qc.ueg_qc(r_ws, spins, numkPoints=numkPoints)
-    kpoints = system.get_k_points()
-    numkPoints = kpoints.shape[0]
-    h1 = system.get_h1_real(kpoints)
-    eri = system.get_eri_tensor_real(kpoints)
-    
-    mol = gto.M(verbose=0)
-    mol.nelectron = system.n_particles
-    mol.incore_anyway = True
-    mol.energy_nuc = lambda *args: 0.0
-    
-    umf = scf.UHF(mol)
-    umf.max_cycle = 200
-    umf.get_hcore = lambda *args: [h1, h1]
-    umf.get_ovlp = lambda *args: np.eye(numkPoints)
-    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
-    
-    dm0 = umf.get_init_guess()
-    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
-    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
-    umf.level_shift = 0.4
-
-    umf.kernel(dm0)
-    
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    umf.stability(external=False)
-
-    energy = umf.e_tot
-    kpoints = jnp.array(kpoints)
-    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
-    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
-
-    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
 
 class LogFixedCYJastrow(Wavefunction):
     """
