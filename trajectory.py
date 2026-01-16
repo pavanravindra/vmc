@@ -48,10 +48,11 @@ class MALAUpdater:
     def updateConfiguration(self, parameters, rs1, rng, tau):
 
         def clip(jnpArray):
-            # Clips elements of `jnpArray` to have absolute value <= r_ws / 10
-            maxValue = self.r_ws / 10
-            mask = jnp.abs(jnpArray) > maxValue
-            return jnp.where(mask, maxValue * jnp.sign(jnpArray), jnpArray)
+            # Scales the list of vecs in `jnpArray` to have norm <= maxvalue
+            maxValue = self.r_ws / 25
+            norms = jnp.linalg.norm(jnpArray, axis=-1, keepdims=True)
+            scale = jnp.minimum(1.0, maxValue / (norms + 1e-12))
+            return jnpArray * scale
     
         def proposalProb(Ri, Rf):
             # Returns (unnormalized) proposal probability P(Rf | Ri)
