@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax.nn import initializers
 
 from flax import linen as nn
 from flax.serialization import to_bytes, from_bytes
@@ -338,6 +339,65 @@ class LogCYJastrow(Wavefunction):
 
         return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
 
+class LogFixedCYJastrow(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
+    and different spin electrons are handled by different $A$ parameters.
+    In this instance, the $A$ parameters are *fixed* at initialization.
+
+    The conventional $F$ parameters are set by the cusp conditions.
+
+    NOTE: In this implementation, we always take the absolute values of the $A$
+    parameters. This is so that even if negative values are encountered during
+    optimization, the resulting wavefunction remains physical.
+    """
+    spins : (int,int)
+    lattice: jnp.ndarray
+    As : jnp.ndarray
+
+    def setup(self):
+
+        N = self.spins[0] + self.spins[1]
+        volume = jnp.abs(jnp.linalg.det(self.lattice))
+        n = N / volume
+
+        self.rec_lattice = jnp.linalg.inv(self.lattice)
+
+    def __call__(self, rs):
+
+        N = rs.shape[0]
+
+        A_same = jnp.abs(self.As[0])
+        A_diff = jnp.abs(self.As[1])
+        
+        F_same = jnp.sqrt(2 * A_same)
+        F_diff = jnp.sqrt(A_diff)
+
+        disp_real_raw = rs[:,None,:] - rs[None,:,:]
+        disp_frac = jnp.dot(disp_real_raw, self.rec_lattice)
+        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
+        disp_real_mic = jnp.dot(disp_frac, self.lattice)
+
+        eye_mask = jnp.eye(N)[:,:,None]
+        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
+        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
+        
+        n_up, n_down = self.spins
+        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
+        
+        mask_same = spin_mask[:,None] == spin_mask[None,:]
+        mask_diff = spin_mask[:,None] != spin_mask[None,:]
+        eye = jnp.eye(N, dtype=bool)
+        mask_same = mask_same & (~eye)
+        
+        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
+        val_same = jnp.where(mask_same, val_same, 0.0)
+
+        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
+        val_diff = jnp.where(mask_diff, val_diff, 0.0)
+
+        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
+
 class LogSimpleSlaters(Wavefunction):
     """
     Creates a log-wavefunction that is the product of two simple Slater
@@ -406,7 +466,9 @@ class LogTwoBodySJ(Wavefunction):
         self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
         
         self.linearSelf1 = nn.Dense(self.hiddenFeatures)
-        self.linearSelf2 = nn.Dense(1)
+        self.linearSelf2 = nn.Dense(
+            1, initializers.zeros, bias_init=initializers.zeros
+        )
 
     def __call__(self, rs):
         
@@ -1106,74 +1168,6 @@ class LogMessagePassingSJBLayerNorm(Wavefunction):
 
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
-class LogFixedCYJastrow(Wavefunction):
-    """
-    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
-    and different spin electrons are handled by different $A$ parameters.
-
-    The conventional $F$ parameters are set by the cusp conditions.
-
-    IMPORTANT: These $A$ parameters are *fixed* in this class! 
-
-    NOTE: In this implementation, we always take the absolute values of the $A$
-    parameters. This is so that even if negative values are encountered during
-    optimization, the resulting wavefunction remains physical.
-    """
-    spins : (int,int)
-    L : float
-
-    def setup(self):
-
-        N = self.spins[0] + self.spins[1]
-        n = N / (self.L**3.)
-        self.A = 1.0 / jnp.sqrt(4 * jnp.pi * n)
-
-    def __call__(self, rs):
-
-        A_same = self.A
-        A_diff = self.A
-        
-        F_same = jnp.sqrt(2 * A_same)
-        F_diff = jnp.sqrt(A_diff)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        disps = (disps + self.L/2) % self.L - self.L/2
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
-        r_ij = jnp.linalg.norm(disps, axis=-1)
-
-        same_up = getOffDiagonalFlat(r_ij[:self.spins[0],:self.spins[0]])
-        same_down = getOffDiagonalFlat(r_ij[self.spins[0]:,self.spins[0]:])
-        sameDists = jnp.concatenate([same_up, same_down])
-        sameCY = coulombYukawa(sameDists, A_same, F_same, self.L)
-        
-        diffDists = r_ij[:self.spins[0],self.spins[0]:].flatten()
-        diffCY = coulombYukawa(diffDists, A_diff, F_diff, self.L)
-
-        return -0.5 * jnp.sum(sameCY) - jnp.sum(diffCY)
-
-class LogSlaterFixedCYJastrow(Wavefunction):
-    """
-    Creates a log-wavefunction that is the product of two simple Slater
-    determinant with the lowest k-points filled and a Coulomb-Yukawa Jastrow.
-
-    Since the CYJastrow's parameters are fixed, there are no variational
-    parameters in this wavefunction class.
-    """
-    spins : (int,int)
-    L : float
-
-    def setup(self):
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
-        CYJastrow = self.CYJastrow(rs)
-        return slaterUp + slaterDown + CYJastrow
-
 class LogWignerCrystalSlater(Wavefunction):
     """
     Slater determinant reference for a 3D Wigner crystal.
@@ -1344,26 +1338,6 @@ class LogTwoBodySJBGaussianWignerCrystal(Wavefunction):
         
         return wignerSlater + CYJastrow + neuralJastrow
 
-class LogWignerCrystalSlaterFixedCYJastrow(Wavefunction):
-    """
-    Creates a log-wavefunction that is the product of two simple Slater
-    determinant with the Wigner crystal as the reference state.
-
-    Since the CYJastrow's parameters are fixed, there are no variational
-    parameters in this wavefunction class.
-    """
-    spins : (int,int)
-    L : float
-
-    def setup(self):
-        self.wignerSlater = LogWignerCrystalSlater(self.spins, self.L)
-        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        wignerSlater = self.wignerSlater(rs)
-        CYJastrow = self.CYJastrow(rs)
-        return wignerSlater + CYJastrow
-
 class LogUHFSlaters(Wavefunction):
     """
     Creates a log-wavefunction that is the product of two unrestricted Slater
@@ -1452,51 +1426,3 @@ class LogUMPSlaters(Wavefunction):
         downSlater = jnp.linalg.slogdet(downMatrix @ self.spinDownCoeff)[1]
         
         return upSlater + downSlater
-    
-class LogUHFCY(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: UHF solution (fixed)
-    - Jastrow: Coulomb-Yukawa
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpInit : jnp.ndarray
-    spinDownInit : jnp.ndarray
-
-    def setup(self):
-        self.slater = LogUHFSlaters(
-            self.spins, self.L,
-            self.kpoints, self.spinUpInit, self.spinDownInit
-        )
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        slater = self.slater(rs)
-        CYJastrow = self.CYJastrow(rs)
-        return slater + CYJastrow
-    
-class LogUMPCY(Wavefunction):
-    """
-    Slater-Jastrow wavefunction with following specs:
-    - Slater: unrestricted sum of multiple planewaves
-    - Jastrow: Fixed Coulomb-Yukawa
-    """
-    spins : (int,int)
-    L : float
-    kpoints : jnp.ndarray
-    spinUpInit : jnp.ndarray
-    spinDownInit : jnp.ndarray
-
-    def setup(self):
-        self.slater = LogUMPSlaters(
-            self.spins, self.L,
-            self.kpoints, self.spinUpInit, self.spinDownInit
-        )
-        self.CYJastrow = LogFixedCYJastrow(self.spins, self.L)
-
-    def __call__(self, rs):
-        slater = self.slater(rs)
-        CYJastrow = self.CYJastrow(rs)
-        return slater + CYJastrow
