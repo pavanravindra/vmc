@@ -223,38 +223,20 @@ class LogSimpleSlater(Wavefunction):
     Creates a log-wavefunction that is just a simple Slater determinant of the
     input electron coordinates. The basis for the determinant is specified by
     the provided kpoints.
-    
+
     NOTE: These determinants use the convention that different particle
-    positions are in different rows. Columns correspond to plane wave orbitals.
+    positions are in different columns. Rows correspond to plane wave orbitals.
     """
     N : int
     dim : int
     kpoints : jnp.ndarray
 
     def setup(self):
-        
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
-            
-        weights = 10.0 ** jnp.arange(1, self.dim + 1)
-        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
-        k_signs = jnp.sign(weighted_sums + 1.0)
-        self.cos_switch = (k_signs + 1.0) / 2.0
-        self.sin_switch = (1.0 - k_signs) / 2.0
 
     def __call__(self, rs):
-        def makeSimpleSlaterRow(ri):
-            def localKpointFunction(k, c_switch, s_switch):
-                dot_val = jnp.dot(k, ri)
-                term = (c_switch * jnp.cos(dot_val) + 
-                        s_switch * jnp.sin(-dot_val))
-                return term
-            return jax.vmap(localKpointFunction)(
-                self.kpoints, 
-                self.cos_switch, 
-                self.sin_switch
-            )
-        slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
+        slaterMatrix = jnp.exp(1j * self.kpoints @ rs.T)
         return jnp.linalg.slogdet(slaterMatrix)[1]
 
 def coulombYukawa(r_real, r_frac, A, F):
@@ -640,39 +622,28 @@ class LogMPSlater(Wavefunction):
     Creates a log-wavefunction that is a Slater determinant built from a
     multiple planewave basis.
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray
-    init_coeffs : jnp.ndarray
+    N: int
+    dim: int
+    kpoints: jnp.ndarray          # (Nk, dim)
+    init_coeffs: jnp.ndarray      # (N, Nk) or (N, Nk) complex
 
     def setup(self):
-        
-        if not (self.dim == 2 or self.dim == 3):
-            raise Exception("Only dim=2 or dim=3 are supported.")
 
-        self.numKpoints = self.kpoints.shape[0]
-        weights = 10.0 ** jnp.arange(1, self.dim + 1)
-        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
-        k_signs = jnp.sign(weighted_sums + 1.0)
-        self.cos_switch = (k_signs + 1.0) / 2.0
-        self.sin_switch = (1.0 - k_signs) / 2.0
+        if self.dim not in (2, 3):
+            raise ValueError("Only dim=2 or dim=3 are supported.")
 
-        self.mp_coeffs = self.param(
-            "MP_coefficients", lambda rng: self.init_coeffs
-        )
+        Nk = self.kpoints.shape[0]
+        if self.init_coeffs.shape != (self.N, Nk):
+            raise ValueError(f"Expected init_coeffs shape (N, Nk)={(self.N, Nk)} "
+                             f"but got {self.init_coeffs.shape}")
+
+        self.C = self.param("MP_coefficients", lambda rng: self.init_coeffs)
 
     def __call__(self, rs):
-        def makeBasisRow(ri):
-            def localKpointFunction(k, c_switch, s_switch):
-                dot_val = jnp.dot(k, ri)
-                return c_switch * jnp.cos(dot_val) + s_switch * jnp.sin(-dot_val)
-            terms = jax.vmap(localKpointFunction)(
-                self.kpoints, self.cos_switch, self.sin_switch
-            )
-            return terms
-        basisMatrix = jax.vmap(makeBasisRow)(rs)
-        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)
-        return jnp.linalg.slogdet(orbitalMatrix)[1]
+
+        eikrs = jnp.exp(1j * (self.kpoints @ rs.T))   # ( Nk , N )
+        slaterMatrix = self.C @ eikrs                 # ( N , N )
+        return jnp.linalg.slogdet(slaterMatrix)[1]
 
 class LogMPTwoBodySJB(Wavefunction):
     """
@@ -753,37 +724,29 @@ class LogMPTwoBodySJB(Wavefunction):
 class LogFixedMPSlater(Wavefunction):
     """
     Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis.
+    multiple planewave basis, where the coefficients for the sum of planewaves
+    is fixed.
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray
-    coeffs : jnp.ndarray
+    N: int
+    dim: int
+    kpoints: jnp.ndarray          # (Nk, dim)
+    mp_coeffs: jnp.ndarray        # (N, Nk) or (N, Nk) complex
 
     def setup(self):
-        
-        if not (self.dim == 2 or self.dim == 3):
-            raise Exception("Only dim=2 or dim=3 are supported.")
 
-        self.numKpoints = self.kpoints.shape[0]
-        weights = 10.0 ** jnp.arange(1, self.dim + 1)
-        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
-        k_signs = jnp.sign(weighted_sums + 1.0)
-        self.cos_switch = (k_signs + 1.0) / 2.0
-        self.sin_switch = (1.0 - k_signs) / 2.0
+        if self.dim not in (2, 3):
+            raise ValueError("Only dim=2 or dim=3 are supported.")
+
+        Nk = self.kpoints.shape[0]
+        if self.mp_coeffs.shape != (self.N, Nk):
+            raise ValueError(f"Expected mp_coeffs shape (N, Nk)={(self.N, Nk)} "
+                             f"but got {self.mp_coeffs.shape}")
 
     def __call__(self, rs):
-        def makeBasisRow(ri):
-            def localKpointFunction(k, c_switch, s_switch):
-                dot_val = jnp.dot(k, ri)
-                return c_switch * jnp.cos(dot_val) + s_switch * jnp.sin(-dot_val)
-            terms = jax.vmap(localKpointFunction)(
-                self.kpoints, self.cos_switch, self.sin_switch
-            )
-            return terms
-        basisMatrix = jax.vmap(makeBasisRow)(rs)
-        orbitalMatrix = jnp.dot(basisMatrix, self.coeffs)
-        return jnp.linalg.slogdet(orbitalMatrix)[1]
+
+        eikrs = jnp.exp(1j * (self.kpoints @ rs.T))   # ( Nk , N )
+        slaterMatrix = self.mp_coeffs @ eikrs         # ( N , N )
+        return jnp.linalg.slogdet(slaterMatrix)[1]
 
 class LogFixedMPTwoBodySJB(Wavefunction):
     """
