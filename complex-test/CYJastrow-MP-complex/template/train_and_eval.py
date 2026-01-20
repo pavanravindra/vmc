@@ -88,18 +88,20 @@ class LogMPCYJastrow(wavefunctions.Wavefunction):
     dim : int
     lattice : jnp.ndarray
     kpoints : jnp.ndarray
-    upCoeffs : jnp.ndarray
-    downCoeffs : jnp.ndarray
+    upCoeffs_re : jnp.ndarray
+    upCoeffs_im : jnp.ndarray
+    downCoeffs_re : jnp.ndarray
+    downCoeffs_im : jnp.ndarray
 
     def setup(self):
 
         N = self.spins[0] + self.spins[1]
 
         self.slaterUp = wavefunctions.LogMPSlater(
-            self.spins[0], self.dim, self.kpoints, self.upCoeffs
+            self.spins[0], self.dim, self.kpoints, self.upCoeffs_re, self.upCoeffs_im
         )
         self.slaterDown = wavefunctions.LogMPSlater(
-            self.spins[1], self.dim, self.kpoints, self.downCoeffs
+            self.spins[1], self.dim, self.kpoints, self.downCoeffs_re, self.downCoeffs_im
         )
         self.CYJastrow = wavefunctions.LogCYJastrow(self.spins, self.lattice)
 
@@ -112,17 +114,19 @@ class LogMPCYJastrow(wavefunctions.Wavefunction):
         return slaterUp + slaterDown + CYJastrow 
 
 diagMatrix = np.eye(spins[0], numKpoints)
-upNoise = 1e-3 * np.random.normal(size=diagMatrix.shape) + 1e-6 * 1j * np.random.normal(size=diagMatrix.shape)
-downNoise = 1e-3 * np.random.normal(size=diagMatrix.shape) + 1e-6 * 1j * np.random.normal(size=diagMatrix.shape)
-upCoeffs = jnp.array(diagMatrix) + upNoise
-downCoeffs = jnp.array(diagMatrix) + downNoise
+upCoeffs_re = jnp.array(diagMatrix) + 1e-3 * np.random.normal(size=diagMatrix.shape)
+upCoeffs_im = 1e-6 * np.random.normal(size=(diagMatrix.shape))
+downCoeffs_re = jnp.array(diagMatrix) + 1e-3 * np.random.normal(size=diagMatrix.shape)
+downCoeffs_im = 1e-6 * np.random.normal(size=(diagMatrix.shape))
 
+upCoeffs = upCoeffs_re + 1j * upCoeffs_im
+downCoeffs = downCoeffs_re + 1j * downCoeffs_im
 np.save("init_upCoeffs.npy", upCoeffs)
 np.save("init_downCoeffs.npy", downCoeffs)
 print("Up-Down Difference:\t{}".format(jnp.linalg.norm(upCoeffs - downCoeffs)))
 
 wavefunction = LogMPCYJastrow(
-    spins, dim, lattice, kpoints, upCoeffs, downCoeffs
+    spins, dim, lattice, kpoints, upCoeffs_re, upCoeffs_im, downCoeffs_re, downCoeffs_im
 )
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 if dim == 2:
