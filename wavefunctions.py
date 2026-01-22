@@ -82,51 +82,6 @@ def loadParameters(filename):
         parameters = from_bytes(FrozenDict, f.read())
     return parameters
 
-def testAntisymmetry(wavefunction, parameters, rs, tol=1e-6):
-    """
-    Tests that the `apply` method of a wavefunction object properly obeys
-    Fermionic antisymmetry rules.
-    """
-
-    N = rs.shape[0]
-    referenceValue = wavefunction.apply(parameters, rs)
-
-    # Swapping spin up electrons
-    for i in range(wavefunction.spins[0]):
-        
-        localBatch = []
-        for j in range(wavefunction.spins[0]):
-            if i == j:
-                continue;
-            localRs = np.array(rs)
-            localRs[[i,j]] = localRs[[j,i]]
-            localBatch.append(localRs)
-        localBatch = jnp.array(localBatch)
-
-        batchResults = wavefunction.applyBatch(parameters, localBatch)
-
-        if any(jnp.abs(batchResults - referenceValue) > tol):
-            raise Exception("This wavefunction is not antisymmetric!")
-    
-    # Swapping spin down electrons
-    for i in range(wavefunction.spins[0],N):
-        
-        localBatch = []
-        for j in range(wavefunction.spins[0],N):
-            if i == j:
-                continue;
-            localRs = np.array(rs)
-            localRs[[i,j]] = localRs[[j,i]]
-            localBatch.append(localRs)
-        localBatch = jnp.array(localBatch)
-
-        batchResults = wavefunction.applyBatch(parameters, localBatch)
-
-        if any(jnp.abs(batchResults - referenceValue) > tol):
-            raise Exception("This wavefunction is not antisymmetric!")
-
-    return True
-
 class Wavefunction(nn.Module):
     """
     Defines batched functions based on single-walker functions. This way you
@@ -140,83 +95,108 @@ class Wavefunction(nn.Module):
         vmapApply = jax.vmap(self.apply, in_axes=(None,0))
         return vmapApply(parameters, walkerRs)
 
-def genKpoints(N, lattice, dim):
+def _canonical_pos_int(k_int: np.ndarray) -> bool:
     """
-    Generates N k-points sorted by energy, ensuring +/- k pairs are adjacent.
-    
-    Sequence: [0, k1, -k1, k2, -k2, ...]
-    
-    Args:
-        N: Number of k-points required.
-        lattice: (dim, dim) numpy array (real space lattice vectors).
-        dim: 2 or 3.
+    Decide whether an integer k-vector is the canonical 'positive' representative
+    of the ± pair, using lexicographic sign rule:
+        first nonzero component must be positive.
     """
-    # Force lattice to concrete numpy for static integer generation
-    lattice = np.array(lattice)
-    
-    if not (dim == 2 or dim == 3):
-        raise ValueError("Only dim=2 or dim=3 are supported.")
-    
-    # 1. Reciprocal Lattice
-    rec_lattice = 2 * np.pi * np.linalg.inv(lattice).T
-    rec_norms = np.linalg.norm(rec_lattice, axis=1)
+    for x in k_int:
+        if x > 0:
+            return True
+        if x < 0:
+            return False
+    return True  # k=0 treated as positive
 
-    # 2. Estimate Integer Bounds (with safety factor for anisotropy)
-    vol_k_cell = np.abs(np.linalg.det(rec_lattice))
-    
+def genKpoints(N: int, lattice, dim: int, safety: float = 2.5, extra: int = 4):
+    """
+    Deterministic k-point generator with stable ordering and adjacent ± pairs.
+
+    Ordering:
+        [0, k1, -k1, k2, -k2, ...]
+    where k_i are chosen by increasing |k|, with deterministic tie-breaking.
+
+    Notes:
+    - Uses integer lattice vectors m, maps to physical k = m @ rec_lattice.
+    - Tie-break for equal |k| is lexicographic on integer components (dim-wise).
+    - Picks only the canonical representative of each ± pair in the main loop,
+      then appends its negative.
+
+    Args:
+        N: number of k-points to return
+        lattice: (dim, dim) real-space lattice (rows are lattice vectors)
+        dim: 2 or 3
+        safety: multiplies radius estimate to ensure candidate set contains enough points
+        extra: additive padding on integer bounds
+
+    Returns:
+        (N, dim) jnp.ndarray of k-points
+    """
+    if dim not in (2, 3):
+        raise ValueError("Only dim=2 or dim=3 are supported.")
+    lattice = np.array(lattice, dtype=np.float64)
+    rec_lattice = 2 * np.pi * np.linalg.inv(lattice).T  # (dim, dim)
+
+    # --- Choose a conservative integer search box ---
+    # Estimate k-radius for N points in k-space volume, then map to integer bounds.
+    vol_k_cell = abs(np.linalg.det(rec_lattice))
     if dim == 2:
-        k_radius = (N * vol_k_cell / np.pi)**0.5
+        k_radius = np.sqrt(N * vol_k_cell / np.pi)
     else:
-        k_radius = (N * vol_k_cell * 3 / (4 * np.pi))**(1.0/3.0)
-        
-    # Safety factor of 1.5 + buffer to handle anisotropic boxes
-    max_integers = np.ceil(1.5 * k_radius / rec_norms).astype(int) + 2
-    
-    # 3. Generate Integer Grid
-    ranges = [range(-m, m+1) for m in max_integers]
-    int_candidates = np.array(list(itertools.product(*ranges)))
-    
-    # 4. Sort Candidates by PHYSICAL Norm
-    phys_k = int_candidates @ rec_lattice
-    norms = np.linalg.norm(phys_k, axis=1)
-    
-    # Sort indices based on energy (norm)
-    sorted_indices = np.argsort(norms)
-    candidates_sorted = int_candidates[sorted_indices]
-    
-    # 5. Selection Loop with +/- Pairing
-    selected_ints = []
-    seen_hashes = set()
-    
-    for k_vec in candidates_sorted:
-        if len(selected_ints) >= N:
+        k_radius = (N * vol_k_cell * 3.0 / (4.0 * np.pi)) ** (1.0 / 3.0)
+
+    rec_norms = np.linalg.norm(rec_lattice, axis=1)  # norms of reciprocal basis vectors
+    max_integers = np.ceil((safety * k_radius) / rec_norms).astype(int) + extra  # (dim,)
+
+    ranges = [range(-m, m + 1) for m in max_integers]
+    int_candidates = np.array(list(itertools.product(*ranges)), dtype=int)  # (M, dim)
+
+    # Physical k and squared norms
+    phys_k = int_candidates @ rec_lattice  # (M, dim)
+    k2 = np.einsum("ij,ij->i", phys_k, phys_k)  # (M,)
+
+    # Deterministic sort: primary key k2, then integer components lexicographically
+    # np.lexsort uses last key as primary, so we pass reversed order.
+    keys = [int_candidates[:, d] for d in range(dim-1, -1, -1)] + [k2]
+    order = np.lexsort(keys)
+    candidates_sorted = int_candidates[order]
+
+    selected = []
+    seen = set()
+
+    # Ensure k=0 is first if present
+    zero = tuple([0] * dim)
+    if zero in map(tuple, candidates_sorted):
+        selected.append(np.array(zero, dtype=int))
+        seen.add(zero)
+
+    for k_int in candidates_sorted:
+        if len(selected) >= N:
             break
-            
-        # Use tuple for efficient set lookup
-        k_tuple = tuple(k_vec)
-        
-        if k_tuple in seen_hashes:
+
+        kt = tuple(k_int)
+        if kt in seen:
             continue
-            
-        # Found a new lowest-energy vector. Add it.
-        selected_ints.append(k_vec)
-        seen_hashes.add(k_tuple)
-        
-        # If we still need points, immediately try to add -k
-        if len(selected_ints) < N:
-            neg_k_vec = -k_vec
-            neg_k_tuple = tuple(neg_k_vec)
-            
-            # Add -k if it hasn't been added (and isn't 0)
-            if neg_k_tuple not in seen_hashes:
-                selected_ints.append(neg_k_vec)
-                seen_hashes.add(neg_k_tuple)
-                
-    # 6. Final Conversion to Physical Vectors
-    selected_ints = np.array(selected_ints)
-    chosenKpoints = selected_ints @ rec_lattice
-    
-    return jnp.array(chosenKpoints)
+        if kt == zero:
+            continue
+
+        # Only consider canonical representative for each ± pair
+        if not _canonical_pos_int(k_int):
+            continue
+
+        # Add k
+        selected.append(k_int.copy())
+        seen.add(kt)
+
+        # Add -k if room
+        if len(selected) < N:
+            nk = tuple((-k_int).tolist())
+            selected.append((-k_int).copy())
+            seen.add(nk)
+
+    selected = np.array(selected[:N], dtype=np.float64)
+    chosen = selected @ rec_lattice
+    return jnp.array(chosen)
 
 class LogSimpleSlater(Wavefunction):
     """
@@ -224,20 +204,84 @@ class LogSimpleSlater(Wavefunction):
     input electron coordinates. The basis for the determinant is specified by
     the provided kpoints.
 
+    IMPORTANT: This code assumes that the k-points come in order like
+                [0, k1, -k1, k2, -k2, ...]
+    
     NOTE: These determinants use the convention that different particle
-    positions are in different columns. Rows correspond to plane wave orbitals.
+    positions are in different rows. Columns correspond to plane wave orbitals.
     """
     N : int
     dim : int
     kpoints : jnp.ndarray
 
     def setup(self):
+        
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
+            
+        Nk = self.kpoints.shape[0]
+        cos = jnp.zeros(Nk).at[0].set(1.0)
+        cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
+        self.cos_switch = cos
+        self.sin_switch = 1.0 - cos
 
     def __call__(self, rs):
-        slaterMatrix = jnp.exp(1j * self.kpoints @ rs.T)
+        def makeSimpleSlaterRow(ri):
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                term = (c_switch * jnp.cos(dot_val) + 
+                        s_switch * jnp.sin(dot_val))
+                return term
+            return jax.vmap(localKpointFunction)(
+                self.kpoints, 
+                self.cos_switch, 
+                self.sin_switch
+            )
+        slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
         return jnp.linalg.slogdet(slaterMatrix)[1]
+
+class LogMPSlater(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Slater determinant built from a
+    multiple planewave basis.
+
+    IMPORTANT: This code assumes that the k-points come in order like
+                [0, k1, -k1, k2, -k2, ...]
+    """
+    N : int
+    dim : int
+    kpoints : jnp.ndarray       # ( Nk , dim )
+    init_coeffs : jnp.ndarray   # ( Nk , N )
+
+    def setup(self):
+        
+        if not (self.dim == 2 or self.dim == 3):
+            raise Exception("Only dim=2 or dim=3 are supported.")
+            
+        Nk = self.kpoints.shape[0]
+        cos = jnp.zeros(Nk).at[0].set(1.0)
+        cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
+        self.cos_switch = cos
+        self.sin_switch = 1.0 - cos
+
+        self.mp_coeffs = self.param(
+            "MP_coefficients", lambda rng: self.init_coeffs
+        )
+
+    def __call__(self, rs):
+        def makeBasisRow(ri):
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                term = (c_switch * jnp.cos(dot_val) + 
+                        s_switch * jnp.sin(dot_val))
+                return term
+            terms = jax.vmap(localKpointFunction)(
+                self.kpoints, self.cos_switch, self.sin_switch
+            )
+            return terms
+        basisMatrix = jax.vmap(makeBasisRow)(rs)               # ( N , Nk )
+        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)   # ( N , N )
+        return jnp.linalg.slogdet(orbitalMatrix)[1]
 
 def coulombYukawa(r_real, r_frac, A, F):
     """
@@ -257,6 +301,41 @@ def coulombYukawa(r_real, r_frac, A, F):
     decay = jnp.exp(1 - 1 / (1 - x**2))
     
     return cy * decay
+
+def cyJastrowForwardFunction(rs, spins, lattice, rec_lattice, As):
+
+        N = rs.shape[0]
+
+        A_same = jnp.abs(As[0])
+        A_diff = jnp.abs(As[1])
+        
+        F_same = jnp.sqrt(2 * A_same)
+        F_diff = jnp.sqrt(A_diff)
+
+        disp_real_raw = rs[:,None,:] - rs[None,:,:]
+        disp_frac = jnp.dot(disp_real_raw, rec_lattice)
+        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
+        disp_real_mic = jnp.dot(disp_frac, lattice)
+
+        eye_mask = jnp.eye(N)[:,:,None]
+        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
+        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
+        
+        n_up, n_down = spins
+        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
+        
+        mask_same = spin_mask[:,None] == spin_mask[None,:]
+        mask_diff = spin_mask[:,None] != spin_mask[None,:]
+        eye = jnp.eye(N, dtype=bool)
+        mask_same = mask_same & (~eye)
+        
+        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
+        val_same = jnp.where(mask_same, val_same, 0.0)
+
+        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
+        val_diff = jnp.where(mask_diff, val_diff, 0.0)
+
+        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
 
 class LogCYJastrow(Wavefunction):
     """
@@ -280,125 +359,32 @@ class LogCYJastrow(Wavefunction):
         n = N / volume
 
         self.rec_lattice = jnp.linalg.inv(self.lattice)
-
         self.As = self.param(
             "As_same_diff",
             lambda rng: jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
         )
 
     def __call__(self, rs):
-
-        N = rs.shape[0]
-
-        A_same = jnp.abs(self.As[0])
-        A_diff = jnp.abs(self.As[1])
-        
-        F_same = jnp.sqrt(2 * A_same)
-        F_diff = jnp.sqrt(A_diff)
-
-        disp_real_raw = rs[:,None,:] - rs[None,:,:]
-        disp_frac = jnp.dot(disp_real_raw, self.rec_lattice)
-        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
-        disp_real_mic = jnp.dot(disp_frac, self.lattice)
-
-        eye_mask = jnp.eye(N)[:,:,None]
-        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
-        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
-        
-        n_up, n_down = self.spins
-        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
-        
-        mask_same = spin_mask[:,None] == spin_mask[None,:]
-        mask_diff = spin_mask[:,None] != spin_mask[None,:]
-        eye = jnp.eye(N, dtype=bool)
-        mask_same = mask_same & (~eye)
-        
-        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
-        val_same = jnp.where(mask_same, val_same, 0.0)
-
-        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
-        val_diff = jnp.where(mask_diff, val_diff, 0.0)
-
-        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
+        return cyJastrowForwardFunction(
+            rs, self.spins, self.lattice, self.rec_lattice, self.As
+        )
 
 class LogFixedCYJastrow(Wavefunction):
     """
-    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
-    and different spin electrons are handled by different $A$ parameters.
-    In this instance, the $A$ parameters are *fixed* at initialization.
-
-    The conventional $F$ parameters are set by the cusp conditions.
-
-    NOTE: In this implementation, we always take the absolute values of the $A$
-    parameters. This is so that even if negative values are encountered during
-    optimization, the resulting wavefunction remains physical.
+    Same as LogCYJastrow but the $A$ parameters are *fixed* at initialization.
     """
     spins : (int,int)
     lattice: jnp.ndarray
     As : jnp.ndarray
 
     def setup(self):
-
-        N = self.spins[0] + self.spins[1]
         volume = jnp.abs(jnp.linalg.det(self.lattice))
-        n = N / volume
-
         self.rec_lattice = jnp.linalg.inv(self.lattice)
 
     def __call__(self, rs):
-
-        N = rs.shape[0]
-
-        A_same = jnp.abs(self.As[0])
-        A_diff = jnp.abs(self.As[1])
-        
-        F_same = jnp.sqrt(2 * A_same)
-        F_diff = jnp.sqrt(A_diff)
-
-        disp_real_raw = rs[:,None,:] - rs[None,:,:]
-        disp_frac = jnp.dot(disp_real_raw, self.rec_lattice)
-        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
-        disp_real_mic = jnp.dot(disp_frac, self.lattice)
-
-        eye_mask = jnp.eye(N)[:,:,None]
-        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
-        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
-        
-        n_up, n_down = self.spins
-        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
-        
-        mask_same = spin_mask[:,None] == spin_mask[None,:]
-        mask_diff = spin_mask[:,None] != spin_mask[None,:]
-        eye = jnp.eye(N, dtype=bool)
-        mask_same = mask_same & (~eye)
-        
-        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
-        val_same = jnp.where(mask_same, val_same, 0.0)
-
-        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
-        val_diff = jnp.where(mask_diff, val_diff, 0.0)
-
-        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
-
-class LogSimpleSlaters(Wavefunction):
-    """
-    Creates a log-wavefunction that is the product of two simple Slater
-    determinant with the lowest k-points filled and a Coulomb-Yukawa Jastrow.
-
-    There are 2 variational parameters, both in the Jastrow.
-    """
-    spins : (int,int)
-    dim : int
-    kpoints : jnp.ndarray
-
-    def setup(self):
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
-
-    def __call__(self, rs):
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
-        return slaterUp + slaterDown
+        return cyJastrowForwardFunction(
+            rs, self.spins, self.lattice, self.rec_lattice, self.As
+        )
 
 class LogSlaterCYJastrow(Wavefunction):
     """
@@ -617,34 +603,6 @@ def uhfInitialization(spins, dim, lattice, kpoints, seed=558):
 
     return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
 
-class LogMPSlater(Wavefunction):
-    """
-    Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis.
-    """
-    N: int
-    dim: int
-    kpoints: jnp.ndarray          # (Nk, dim)
-    init_coeffs: jnp.ndarray      # (N, Nk) or (N, Nk) complex
-
-    def setup(self):
-
-        if self.dim not in (2, 3):
-            raise ValueError("Only dim=2 or dim=3 are supported.")
-
-        Nk = self.kpoints.shape[0]
-        if self.init_coeffs.shape != (self.N, Nk):
-            raise ValueError(f"Expected init_coeffs shape (N, Nk)={(self.N, Nk)} "
-                             f"but got {self.init_coeffs.shape}")
-
-        self.C = self.param("MP_coefficients", lambda rng: self.init_coeffs)
-
-    def __call__(self, rs):
-
-        eikrs = jnp.exp(1j * (self.kpoints @ rs.T))   # ( Nk , N )
-        slaterMatrix = self.C @ eikrs                 # ( N , N )
-        return jnp.linalg.slogdet(slaterMatrix)[1]
-
 class LogMPTwoBodySJB(Wavefunction):
     """
     Two-Body Slater-Jastrow-Backflow wavefunction for arbitrary (skewed)
@@ -724,29 +682,37 @@ class LogMPTwoBodySJB(Wavefunction):
 class LogFixedMPSlater(Wavefunction):
     """
     Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis, where the coefficients for the sum of planewaves
-    is fixed.
+    multiple planewave basis.
     """
-    N: int
-    dim: int
-    kpoints: jnp.ndarray          # (Nk, dim)
-    mp_coeffs: jnp.ndarray        # (N, Nk) or (N, Nk) complex
+    N : int
+    dim : int
+    kpoints : jnp.ndarray
+    coeffs : jnp.ndarray
 
     def setup(self):
+        
+        if not (self.dim == 2 or self.dim == 3):
+            raise Exception("Only dim=2 or dim=3 are supported.")
 
-        if self.dim not in (2, 3):
-            raise ValueError("Only dim=2 or dim=3 are supported.")
-
-        Nk = self.kpoints.shape[0]
-        if self.mp_coeffs.shape != (self.N, Nk):
-            raise ValueError(f"Expected mp_coeffs shape (N, Nk)={(self.N, Nk)} "
-                             f"but got {self.mp_coeffs.shape}")
+        self.numKpoints = self.kpoints.shape[0]
+        weights = 10.0 ** jnp.arange(1, self.dim + 1)
+        weighted_sums = jnp.dot(jnp.sign(self.kpoints), weights)
+        k_signs = jnp.sign(weighted_sums + 1.0)
+        self.cos_switch = (k_signs + 1.0) / 2.0
+        self.sin_switch = (1.0 - k_signs) / 2.0
 
     def __call__(self, rs):
-
-        eikrs = jnp.exp(1j * (self.kpoints @ rs.T))   # ( Nk , N )
-        slaterMatrix = self.mp_coeffs @ eikrs         # ( N , N )
-        return jnp.linalg.slogdet(slaterMatrix)[1]
+        def makeBasisRow(ri):
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                return c_switch * jnp.cos(dot_val) + s_switch * jnp.sin(-dot_val)
+            terms = jax.vmap(localKpointFunction)(
+                self.kpoints, self.cos_switch, self.sin_switch
+            )
+            return terms
+        basisMatrix = jax.vmap(makeBasisRow)(rs)
+        orbitalMatrix = jnp.dot(basisMatrix, self.coeffs)
+        return jnp.linalg.slogdet(orbitalMatrix)[1]
 
 class LogFixedMPTwoBodySJB(Wavefunction):
     """
