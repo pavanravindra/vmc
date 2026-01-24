@@ -197,6 +197,7 @@ history = 0.0
 for dt in range(trainSteps):
 
     if dt % 20 == 0:
+        np.save("rs_{}.npy".format(dt), rs)
         wavefunctions.saveParameters("parameters_{}.msgpack".format(dt), parameters)
 
     localLearningRate = eta0 / (1 + (dt / T))
