@@ -167,6 +167,69 @@ def wignerCrystal(spins, lattice, r_ws, walkers, rng, dim=3, gridShape=None):
     
     return allWalkers + noise
 
+def wignerCrystalFloating(spins, lattice, r_ws, walkers, rng, dim=3, gridShape=None):
+    """
+    EXPERIMENTAL: Generates a set of **floating** Wigner Crystal configurations
+    to mimic the Flatiron setup. The "floating" aspect partially restores
+    translational invariance (along only the x-direction).
+    
+    Args:
+        spins: Tuple (n_up, n_down)
+        lattice: (dim, dim) matrix where rows are lattice vectors.
+                 e.g. [[Lx, 0], [Tx, Ty]]
+        r_ws : Wigner-Seitz radius (used to determine magnitude of noise)
+        walkers: Number of walkers to generate
+        rng: JAX random key
+        dim: 2 or 3
+        gridShape: specifies number of grid points along each dimension
+    """
+    
+    NUp = spins[0]
+    NDown = spins[1]
+
+    if dim == 2 and gridShape == (7,4):
+        
+        # FLOATING STRIPED TRIANGULAR PHASE
+
+        if gridShape is None:
+            n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
+            n_side_x = n_side
+            n_side_y = n_side
+        else:
+            ( n_side_x , n_side_y ) = gridShape
+            
+        x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
+        y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
+        
+        xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
+        frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
+        
+        dx = 1.0 / n_side_x
+        dy = 1.0 / n_side_y
+        
+        shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
+        
+        frac_down = (frac_up + shift_vec) % 1.0
+        
+        upPositions = frac_up @ lattice
+        downPositions = frac_down @ lattice
+        
+        singleWalker = jnp.concatenate([
+            upPositions[:NUp], downPositions[:NDown]
+        ], axis=0)
+
+    else:
+        raise Exception("Only Flatiron setup is supported.")
+
+    rng_noise, rng_shift = jax.random.split(rng, 2)
+    allWalkers = jnp.broadcast_to(
+        singleWalker, (walkers,) + singleWalker.shape
+    )
+    noise = jax.random.normal(rng_noise, allWalkers.shape) * r_ws * 0.01
+    shift = (lattice[0,:] / 7) * jax.random.uniform(rng_shift, shape=(walkers,))[:,None,None]
+    
+    return allWalkers + noise + shift
+
 def acceptanceArray(rs1, rs2):
     """
     Returns an array that shows which walkers have been updated to new
