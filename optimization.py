@@ -102,55 +102,6 @@ class EnergyMinimization:
         localParameterGrads = self.parameterGrad(parameters, rs)
         return jax.flatten_util.ravel_pytree(localParameterGrads)[0]
 
-class StochasticReconfiguration:
-    """
-    Updates parameters using stochastic reconfiguration.
-
-    NOTE: With this implementation, the `learningRate` parameter passed to
-    `__call__` can either be a float that is applied evenly to every parameter,
-    or a pytree that specifies parameter-specific learning rates.
-    """
-
-    def __init__(self, logWavefunction, localEnergy):
-        self.localEnergy = localEnergy
-        self.parameterGrad = jax.grad(logWavefunction.apply, argnums=0)
-        self.parameterGradBatchFlat = jax.vmap(
-            self.getParameterGradient, in_axes=(None,0)
-        )
-
-    def __call__(self, parameters, walkerRs, learningRate, diagonalShift):
-        
-        localEnergies = self.localEnergy.batch(parameters, walkerRs)
-        parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
-        (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
-
-        exp_H = jnp.average(localEnergies)
-        exp_O = jnp.average(parameterGrads, axis=0)
-        exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
-
-        f_k = 2 * (exp_O * exp_H - exp_OH)
-        
-        cov = (parameterGrads.T @ parameterGrads) / parameterGrads.shape[0]
-        s_jk = cov - jnp.outer(exp_O,exp_O)
-        diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
-        parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
-        
-        fisherNorm = jnp.dot(f_k, parameterStep)
-        diagonalCorrection = diagonalShift * jnp.linalg.norm(parameterStep)**2
-        fisherNorm = jnp.sqrt(
-            jnp.maximum(fisherNorm - diagonalCorrection, 1e-8)
-        )
-        scale = jnp.minimum(1.0, 1.0 / fisherNorm)
-        scale = jnp.minimum(scale, 1.0 / jnp.linalg.norm(parameterStep))
-        parameterStep = scale * learningRate * parameterStep
-        updatedParameters = unravel(flatParameters + parameterStep)
-
-        return ( scale < 1.0 , localEnergies , updatedParameters )
-
-    def getParameterGradient(self, parameters, rs):
-        localParameterGrads = self.parameterGrad(parameters, rs)
-        return jax.flatten_util.ravel_pytree(localParameterGrads)[0]
-
 def smw_solve(P, f, lam):
     """
     Given a system of equations:
@@ -172,21 +123,18 @@ def smw_solve(P, f, lam):
     
         theta = lambda^{-1} f - lambda^{-1} P.T (lambda I + P P.T)^{-1} P f
     """
-    term1 = f / lam
-    term2 = P.T / lam @ jnp.linalg.solve(
-        lam * jnp.eye(P.shape[0]) + P @ P.T, P @ f
-    )
-    return term1 - term2
+    A = lam * jnp.eye(P.shape[0], dtype=P.dtype) + P @ P.T
+    y = jnp.linalg.solve(A, P @ f)
+    return (f - P.T @ y) / lam
 
-class StochasticReconfigurationSMW:
+class StochasticReconfiguration:
     """
-    Updates parameters using stochastic reconfiguration using the
-    Sherman-Morrison-Woodbury formula (useful when the number of parameters is
-    greater than the number of walkers).
+    Updates parameters using stochastic reconfiguration.
     """
 
-    def __init__(self, logWavefunction, localEnergy):
+    def __init__(self, logWavefunction, localEnergy, mode='normal'):
         self.localEnergy = localEnergy
+        self.mode = mode
         self.parameterGrad = jax.grad(logWavefunction.apply, argnums=0)
         self.parameterGradBatchFlat = jax.vmap(
             self.getParameterGradient, in_axes=(None,0)
@@ -204,9 +152,19 @@ class StochasticReconfigurationSMW:
         exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
 
         f_k = 2 * (exp_O * exp_H - exp_OH)
-        U = parameterGrads - jnp.average(parameterGrads, axis=0, keepdims=True)
-        P = U / jnp.sqrt(numWalkers)
-        parameterStep = smw_solve(P, f_k, diagonalShift)
+        U = parameterGrads - exp_O[None,:]
+
+        if self.mode == 'normal':
+            s_jk = U.T @ U / numWalkers
+            diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0], dtype=s_jk.dtype)
+            parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
+
+        elif self.mode == 'smw':
+            P = U / jnp.sqrt(numWalkers)
+            parameterStep = smw_solve(P, f_k, diagonalShift)
+
+        else:
+            raise Exception("Specified SR mode not supported.")
         
         fisherNorm = jnp.dot(f_k, parameterStep)
         diagonalCorrection = diagonalShift * jnp.linalg.norm(parameterStep)**2
@@ -233,8 +191,9 @@ class StochasticReconfigurationMomentum:
     learning rate to be a pytree).
     """
 
-    def __init__(self, logWavefunction, localEnergy):
+    def __init__(self, logWavefunction, localEnergy, mode='normal'):
         self.localEnergy = localEnergy
+        self.mode = mode
         self.parameterGrad = jax.grad(logWavefunction.apply, argnums=0)
         self.parameterGradBatchFlat = jax.vmap(
             self.getParameterGradient, in_axes=(None,0)
@@ -245,6 +204,7 @@ class StochasticReconfigurationMomentum:
         localEnergies = self.localEnergy.batch(parameters, walkerRs)
         parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
         (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
+        numWalkers = parameterGrads.shape[0]
 
         exp_H = jnp.average(localEnergies)
         exp_O = jnp.average(parameterGrads, axis=0)
@@ -252,11 +212,20 @@ class StochasticReconfigurationMomentum:
 
         g_k = 2 * (exp_O * exp_H - exp_OH)
         f_k = g_k + diagonalShift * mu * history
+        U = parameterGrads - exp_O[None,:]
 
-        cov = (parameterGrads.T @ parameterGrads) / parameterGrads.shape[0]
-        s_jk = cov - jnp.outer(exp_O,exp_O)
-        diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0])
-        parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
+        if self.mode == 'normal':
+            s_jk = U.T @ U / numWalkers
+            diagonalMatrix = diagonalShift * jnp.eye(s_jk.shape[0], dtype=s_jk.dtype)
+            parameterStep = jnp.linalg.solve(s_jk + diagonalMatrix, f_k)
+
+        elif self.mode == 'smw':
+            P = U / jnp.sqrt(numWalkers)
+            parameterStep = smw_solve(P, f_k, diagonalShift)
+
+        else:
+            raise Exception("Specified SR mode not supported.")
+
         fisherNorm = jnp.dot(f_k, parameterStep)
         diagonalCorrection = diagonalShift * jnp.linalg.norm(parameterStep)**2
         fisherNorm = jnp.sqrt(
@@ -264,11 +233,11 @@ class StochasticReconfigurationMomentum:
         )
         scale = jnp.minimum(1.0, 1.0 / fisherNorm)
         scale = jnp.minimum(scale, 1.0 / jnp.linalg.norm(parameterStep))
-        history = scale * parameterStep
+        newHistory = scale * parameterStep
         parameterStep = scale * learningRate * parameterStep
         updatedParameters = unravel(flatParameters + parameterStep)
 
-        return ( scale < 1.0 , localEnergies , updatedParameters , history )
+        return ( scale < 1.0 , localEnergies , updatedParameters , newHistory )
 
 
     def getParameterGradient(self, parameters, rs):
