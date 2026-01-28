@@ -786,149 +786,90 @@ class LogFlatironMP(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
-class LogMessagePassingSJB(Wavefunction):
+class LogBDSJB(Wavefunction):
     """
     Slater-Jastrow wavefunction with following specs:
     - Slater: RHF ground state
     - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
     - Backflow: neural message passing backflow
+
+    This implementation is different from the Flatiron one, namely in that I
+    don't keep a 1-electron channel at all. The Jastrow and backflow are just
+    computed at the end as a sum over the 2-electron channel features.
     """
     spins : (int,int)
-    L : float
-    T : int
-    hiddenFeatures : int
-    d1 : int
-    d2 : int
-    dv : int
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
+    hiddenFeatures : int     # number of features for all MLPs
+    T : int                  # number of rounds of message passing
+    d2 : int                 # number of features for 2-electron channels
 
     def setup(self):
         
-        self.slaterUp = LogSimpleSlater(self.spins[0], self.L)
-        self.slaterDown = LogSimpleSlater(self.spins[1], self.L)
-        self.CYJastrow = LogCYJastrow(self.spins, self.L)
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
+
+        self.dv = 2 * self.dim + 2   # dimensionality of 2-electron features
         
-        self.neuralJastrow1 = nn.Dense(self.hiddenFeatures)
-        self.neuralJastrow2 = nn.Dense(1)
-        
-        self.neuralBackflow1 = nn.Dense(self.hiddenFeatures)
-        self.neuralBackflow2 = nn.Dense(3)
+        self.hij0 = self.param('hij0', lambda _ : jnp.zeros(self.d2 - self.dv))
 
-        self.hi0 = self.param(
-            "hi0",
-            lambda rng : jnp.zeros(self.d1)
-        )
-        self.hij0 = self.param(
-            "hij0",
-            lambda rng : jnp.zeros(self.d2)
-        )
+        self.Wqt = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
+        self.Wkt = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
 
-        self.Wqt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
-        self.Wkt = [
-            nn.Dense(self.d2 + self.dv, use_bias=False) for _ in range(self.T)
-        ]
+        self.Fa1t = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.Fa2t = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
 
-        self.Fmt = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2 + self.dv)
-            ) for _ in range(self.T)
-        ]
+        self.Fb1t = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.Fb2t = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
 
-        self.Alineart = [
-            nn.Dense(self.d2 + self.dv) for _ in range(self.T)
-        ]
+        self.backflowLinear1 = nn.Dense(self.hiddenFeatures)
+        self.backflowLinear2 = nn.Dense(self.dim)
 
-        self.F1t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d1)
-            ) for _ in range(self.T)
-        ]
-        self.F2t = [
-            (
-                nn.Dense(self.hiddenFeatures),
-                nn.Dense(self.d2)
-            ) for _ in range(self.T)
-        ]
+        self.jastrowLinear1 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear2 = nn.Dense(1)
 
     def __call__(self, rs):
-        
-        CYJastrow = self.CYJastrow(rs)
-        
-        disps = rs[:,None,:] - rs[None,:,:]  # (N, N, 3)
-        mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
-        disps = jnp.where(mask, disps, 0.0)
 
-        cosDisps = jnp.cos(2 * jnp.pi * disps / self.L)
-        sinDisps = jnp.sin(2 * jnp.pi * disps / self.L)
-        sinDispsMag = jnp.linalg.norm(
-            jnp.sin(jnp.pi * disps / self.L),
-            axis=-1, keepdims=True
-        )
-        sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
+        N = sum(self.spins)
         
-        N = self.spins[0] + self.spins[1]
-        electronIdxs = jnp.arange(N)
-        electronSpins = jnp.where(electronIdxs < self.spins[0], 1, -1)
-        matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
-        
-        v_ij = jnp.concatenate(
-            [cosDisps, sinDisps, sinDispsMag, matchMatrix],
-            axis=-1
-        )
-
-        #hit = jnp.broadcast_to(self.hi0, (N,self.d1))
-        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2))
+        vij = generateFeatures(rs, self.spins, self.lattice)      # (N,N,dv)
+        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2-self.dv)) # (N,N,d2-dv)
 
         for t in range(self.T):
 
-            #git = hit
-            gijt = jnp.concatenate([hijt,v_ij], axis=-1)
+            gijt = jnp.concatenate([vij, hijt], axis=-1)          # (N,N,d2)
 
-            qijt = self.Wqt[t](gijt)
-            kijt = self.Wkt[t](gijt)
+            qijt = self.Wqt[t](gijt)                              # (N,N,d2)
+            kijt = self.Wkt[t](gijt)                              # (N,N,d2)
+
+            # 2-body info : (N,N,d2-dv)
+            aijt = self.Fa2t[t](nn.swish(self.Fa1t[t](gijt)))
             
-            """
-            # Numpy reference implementation
-            np_Aijt = np.zeros((N,N,self.d2+self.dv))
-            for i in range(N):
-                for j in range(N):
-                    for l in range(N):
-                        np_Aijt[i,j,:] += qijt[i,l,:] * kijt[l,j,:] # / jnp.sqrt(N)
-            """
-
-            Aijt = self.Alineart[t](
-                nn.swish(
-                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
-                )
-            )
-
-            mijt = Aijt * self.Fmt[t][1](nn.swish(self.Fmt[t][0](gijt)))
-            #acc_mijt = jnp.average(mijt, axis=1)
-            
-            #hit += self.F1t[t][1](nn.swish(self.F1t[t][0](
-            #    jnp.concatenate([acc_mijt,git], axis=-1)
-            #)))
-            hijt += self.F2t[t][1](nn.swish(self.F2t[t][0](
-                jnp.concatenate([mijt, gijt], axis=-1)
+            # 3-body info : (N,N,d2-dv)
+            bijt = self.Fb2t[t](nn.swish(self.Fb1t[t](
+                jnp.concatenate([
+                    jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N), gijt
+                ], axis=-1)
             )))
 
-        #git = hit
-        gijt = jnp.concatenate([hijt,v_ij], axis=-1)
-        
-        selfTerm = self.neuralJastrow2(nn.swish(self.neuralJastrow1(gijt)))
-        neuralJastrow = jnp.average(selfTerm)
+            hijt = hijt + aijt + bijt                             # (N,N,d2-dv)
 
-        backflow = jnp.average(
-            self.neuralBackflow2(nn.swish(self.neuralBackflow1(gijt))),
-            axis=1
+        fij = jnp.concatenate([vij, hijt], axis=-1)               # (N,N,d2)
+
+        neuralBackflow = jnp.average(
+            self.backflowLinear2(nn.swish(self.backflowLinear1(fij))), axis=1
         )
-        xs = rs + backflow
+        neuralJastrow = 0.5 * jnp.sum(
+            self.jastrowLinear2(nn.swish(self.jastrowLinear1(fij)))
+        ) / N
+        
+        xs = rs + neuralBackflow
         
         slaterUp = self.slaterUp(xs[:self.spins[0],:])
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
