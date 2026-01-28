@@ -569,62 +569,222 @@ class LogTwoBodySJB(Wavefunction):
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
-def uhfInitialization(spins, dim, lattice, kpoints, seed=558):
+class LogFlatironNOMP(Wavefunction):
     """
-    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
-    `numkPoints` specifies the number of k-points to use in the planewave
-    basis for UHF.
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: RHF ground state
+    - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
+    - Backflow: neural message passing backflow
 
-    Returns the k-points used in the planewave basis and the UHF ground state
-    coefficients for both spin-up and spin-down electrons.
+    Everything is done consistently with the Flatiron implementation, even
+    where I disagree with their architecture.
 
-    The coefficient matrices are of shape (K,N) where K is the number of
-    planewaves and N is the number of particles of each spin.
+    EXCEPT: This implementation does not have a multiple planewave basis for
+    the reference state.
     """
-    
-    np.random.seed(seed)
+    spins : (int,int)
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
+    hiddenFeatures : int     # number of features for all MLPs
+    T : int                  # number of rounds of message passing
+    d1 : int                 # number of features for 1-electron channels
+    d2 : int                 # number of features for 2-electron channels
 
-    cpu_device = jax.devices("cpu")[0]
-    with jax.default_device(cpu_device):
-        kpoints_cpu = jax.device_put(kpoints, cpu_device)
-        lattice_cpu = jax.device_put(lattice, cpu_device)
-        system = qc.ueg_qc(0, spins, dim=dim, e_cut_red=0, basis=lattice_cpu)
-        numkPoints = kpoints_cpu.shape[0]
-        h1_jax = system.get_h1(kpoints_cpu)
-        eri_jax = system.get_eri_tensor_real(kpoints_cpu)
-        h1 = np.asarray(h1_jax, dtype=np.double)
-        eri = np.asarray(eri_jax, dtype=np.double)
-    
-    mol = gto.M(verbose=0)
-    mol.nelectron = system.n_particles
-    mol.incore_anyway = True
-    mol.energy_nuc = lambda *args: 0.0
-    
-    umf = scf.UHF(mol)
-    umf.max_cycle = 200
-    umf.get_hcore = lambda *args: [h1, h1]
-    umf.get_ovlp = lambda *args: np.eye(numkPoints)
-    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
-    
-    dm0 = umf.get_init_guess()
-    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
-    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
-    umf.level_shift = 0.4
+    def setup(self):
+        
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
 
-    umf.kernel(dm0)
-    
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    mo1 = umf.stability(external=False)[0]
-    umf = umf.newton().run(mo1, umf.mo_occ)
-    umf.stability(external=False)
+        self.dv = 2 * self.dim + 2   # dimensionality of 2-electron features
 
-    energy = umf.e_tot
-    kpoints = jnp.array(kpoints)
-    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
-    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
+        self.hi0  = self.param('hi0',  lambda _ : jnp.zeros(self.d1))
+        self.hij0 = self.param('hij0', lambda _ : jnp.zeros(self.d2 - self.dv))
 
-    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
+        self.Wqs = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
+        self.Wks = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
+
+        self.attentionLayers = [nn.Dense(self.d2) for _ in range(self.T)]
+
+        self.Fmt1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.Fmt2s = [nn.Dense(self.d2) for _ in range(self.T)]
+
+        self.F1t1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.F1t2s = [nn.Dense(self.d1) for _ in range(self.T)]
+        
+        self.F2t1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.F2t2s = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
+
+        self.backflowLinear = nn.Dense(self.dim, use_bias=False)
+
+        self.preLinear = nn.Dense(self.d1)
+        self.jastrowLinear1 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear2 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear3 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear4 = nn.Dense(1)
+
+    def __call__(self, rs):
+
+        N = sum(self.spins)
+        
+        vij = generateFeatures(rs, self.spins, self.lattice)      # (N,N,dv)
+        hit = jnp.broadcast_to(self.hi0, (N,self.d1))             # (N,d1)
+        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2-self.dv)) # (N,N,d2-dv)
+
+        for t in range(self.T):
+
+            git = hit                                             # (N,d1)
+            gijt = jnp.concatenate([vij, hijt], axis=-1)          # (N,N,d2)
+
+            qijt = self.Wqs[t](gijt)                              # (N,N,d2)
+            kijt = self.Wks[t](gijt)                              # (N,N,d2)
+
+            Aijt = self.attentionLayers[t](nn.gelu(
+                jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
+            ))                                                    # (N,N,d2)
+            Fmijt = self.Fmt2s[t](nn.gelu(self.Fmt1s[t](gijt)))   # (N,N,d2)
+            mijt = Aijt * Fmijt                                   # (N,N,d2)
+
+            eye_mask = jnp.eye(N, dtype=bool)[:,:,None]
+            acc_mijt = jnp.sum(jnp.where(~eye_mask, mijt, 0.0), axis=1)
+            hit += self.F1t2s[t](nn.gelu(self.F1t1s[t](
+                jnp.concatenate([acc_mijt, git], axis=-1)
+            )))                                                   # (N,N,d1)
+            
+            hijt += self.F2t2s[t](nn.gelu(self.F2t1s[t](
+                jnp.concatenate([mijt, gijt], axis=-1)
+            )))                                                   # (N,N,d2-dv)
+
+        backflow = self.backflowLinear(hit)
+        xs = rs + backflow
+        
+        recLattice = jnp.linalg.inv(self.lattice)
+        xsWrap = ((xs @ recLattice) % 1) @ self.lattice
+
+        jastrowInput = jnp.concatenate(
+            [hit, nn.gelu(self.preLinear(xsWrap))], axis=-1
+        )
+        neuralJastrow = self.jastrowLinear1(jastrowInput)
+        neuralJastrow += self.jastrowLinear2(nn.gelu(neuralJastrow))
+        neuralJastrow += self.jastrowLinear3(nn.gelu(neuralJastrow))
+        neuralJastrow = jnp.sum(self.jastrowLinear4(nn.gelu(neuralJastrow)))
+        
+        slaterUp = self.slaterUp(xsWrap[:self.spins[0],:])
+        slaterDown = self.slaterDown(xsWrap[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
+        
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
+
+class LogFlatironMP(Wavefunction):
+    """
+    Slater-Jastrow wavefunction with following specs:
+    - Slater: MP reference state
+    - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
+    - Backflow: neural message passing backflow
+
+    Everything is done consistently with the Flatiron implementation, even
+    where I disagree with their architecture.
+    """
+    spins : (int,int)
+    dim : int
+    lattice : jnp.ndarray
+    kpoints : jnp.ndarray
+    upCoeffs : jnp.ndarray
+    downCoeffs  : jnp.ndarray
+    hiddenFeatures : int     # number of features for all MLPs
+    T : int                  # number of rounds of message passing
+    d1 : int                 # number of features for 1-electron channels
+    d2 : int                 # number of features for 2-electron channels
+
+    def setup(self):
+        
+        self.slaterUp = LogMPSlater(
+            self.spins[0], self.dim, self.kpoints, self.upCoeffs
+        )
+        self.slaterDown = LogMPSlater(
+            self.spins[1], self.dim, self.kpoints, self.downCoeffs
+        )
+        self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
+
+        self.dv = 2 * self.dim + 2   # dimensionality of 2-electron features
+
+        self.hi0  = self.param('hi0',  lambda _ : jnp.zeros(self.d1))
+        self.hij0 = self.param('hij0', lambda _ : jnp.zeros(self.d2 - self.dv))
+
+        self.Wqs = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
+        self.Wks = [nn.Dense(self.d2, use_bias=False) for _ in range(self.T)]
+
+        self.attentionLayers = [nn.Dense(self.d2) for _ in range(self.T)]
+
+        self.Fmt1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.Fmt2s = [nn.Dense(self.d2) for _ in range(self.T)]
+
+        self.F1t1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.F1t2s = [nn.Dense(self.d1) for _ in range(self.T)]
+        
+        self.F2t1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
+        self.F2t2s = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
+
+        self.backflowLinear = nn.Dense(self.dim, use_bias=False)
+
+        self.preLinear = nn.Dense(self.d1)
+        self.jastrowLinear1 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear2 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear3 = nn.Dense(self.hiddenFeatures)
+        self.jastrowLinear4 = nn.Dense(1)
+
+    def __call__(self, rs):
+
+        N = sum(self.spins)
+        
+        vij = generateFeatures(rs, self.spins, self.lattice)      # (N,N,dv)
+        hit = jnp.broadcast_to(self.hi0, (N,self.d1))             # (N,d1)
+        hijt = jnp.broadcast_to(self.hij0, (N,N,self.d2-self.dv)) # (N,N,d2-dv)
+
+        for t in range(self.T):
+
+            git = hit                                             # (N,d1)
+            gijt = jnp.concatenate([vij, hijt], axis=-1)          # (N,N,d2)
+
+            qijt = self.Wqs[t](gijt)                              # (N,N,d2)
+            kijt = self.Wks[t](gijt)                              # (N,N,d2)
+
+            Aijt = self.attentionLayers[t](nn.gelu(
+                jnp.einsum("ild,ljd->ijd", qijt, kijt) / jnp.sqrt(N)
+            ))                                                    # (N,N,d2)
+            Fmijt = self.Fmt2s[t](nn.gelu(self.Fmt1s[t](gijt)))   # (N,N,d2)
+            mijt = Aijt * Fmijt                                   # (N,N,d2)
+
+            eye_mask = jnp.eye(N, dtype=bool)[:,:,None]
+            acc_mijt = jnp.sum(jnp.where(~eye_mask, mijt, 0.0), axis=1)
+            hit += self.F1t2s[t](nn.gelu(self.F1t1s[t](
+                jnp.concatenate([acc_mijt, git], axis=-1)
+            )))                                                   # (N,N,d1)
+            
+            hijt += self.F2t2s[t](nn.gelu(self.F2t1s[t](
+                jnp.concatenate([mijt, gijt], axis=-1)
+            )))                                                   # (N,N,d2-dv)
+
+        backflow = self.backflowLinear(hit)
+        xs = rs + backflow
+        
+        recLattice = jnp.linalg.inv(self.lattice)
+        xsWrap = ((xs @ recLattice) % 1) @ self.lattice
+
+        jastrowInput = jnp.concatenate(
+            [hit, nn.gelu(self.preLinear(xsWrap))], axis=-1
+        )
+        neuralJastrow = self.jastrowLinear1(jastrowInput)
+        neuralJastrow += self.jastrowLinear2(nn.gelu(neuralJastrow))
+        neuralJastrow += self.jastrowLinear3(nn.gelu(neuralJastrow))
+        neuralJastrow = jnp.sum(self.jastrowLinear4(nn.gelu(neuralJastrow)))
+        
+        slaterUp = self.slaterUp(xsWrap[:self.spins[0],:])
+        slaterDown = self.slaterDown(xsWrap[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
+        
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
 class LogMessagePassingSJB(Wavefunction):
     """
@@ -632,7 +792,6 @@ class LogMessagePassingSJB(Wavefunction):
     - Slater: RHF ground state
     - Jastrow: Coulomb-Yukawa + neural message passing Jastrow
     - Backflow: neural message passing backflow
-
     """
     spins : (int,int)
     L : float
@@ -772,6 +931,63 @@ class LogMessagePassingSJB(Wavefunction):
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
         
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
+
+def uhfInitialization(spins, dim, lattice, kpoints, seed=558):
+    """
+    Runs UHF for uniform electron gas with Wigner-Seitz radius `r_ws`.
+    `numkPoints` specifies the number of k-points to use in the planewave
+    basis for UHF.
+
+    Returns the k-points used in the planewave basis and the UHF ground state
+    coefficients for both spin-up and spin-down electrons.
+
+    The coefficient matrices are of shape (K,N) where K is the number of
+    planewaves and N is the number of particles of each spin.
+    """
+    
+    np.random.seed(seed)
+
+    cpu_device = jax.devices("cpu")[0]
+    with jax.default_device(cpu_device):
+        kpoints_cpu = jax.device_put(kpoints, cpu_device)
+        lattice_cpu = jax.device_put(lattice, cpu_device)
+        system = qc.ueg_qc(0, spins, dim=dim, e_cut_red=0, basis=lattice_cpu)
+        numkPoints = kpoints_cpu.shape[0]
+        h1_jax = system.get_h1(kpoints_cpu)
+        eri_jax = system.get_eri_tensor_real(kpoints_cpu)
+        h1 = np.asarray(h1_jax, dtype=np.double)
+        eri = np.asarray(eri_jax, dtype=np.double)
+    
+    mol = gto.M(verbose=0)
+    mol.nelectron = system.n_particles
+    mol.incore_anyway = True
+    mol.energy_nuc = lambda *args: 0.0
+    
+    umf = scf.UHF(mol)
+    umf.max_cycle = 200
+    umf.get_hcore = lambda *args: [h1, h1]
+    umf.get_ovlp = lambda *args: np.eye(numkPoints)
+    umf._eri = ao2mo.restore(8, np.double(eri), numkPoints)
+    
+    dm0 = umf.get_init_guess()
+    dm0[0] += np.random.randn(numkPoints, numkPoints) * 0.1
+    dm0[1] += np.random.randn(numkPoints, numkPoints) * 0.1
+    umf.level_shift = 0.4
+
+    umf.kernel(dm0)
+    
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    mo1 = umf.stability(external=False)[0]
+    umf = umf.newton().run(mo1, umf.mo_occ)
+    umf.stability(external=False)
+
+    energy = umf.e_tot
+    kpoints = jnp.array(kpoints)
+    spinUpCoeff = jnp.array(umf.mo_coeff[0][:,:spins[0]])
+    spinDownCoeff = jnp.array(umf.mo_coeff[1][:,:spins[1]])
+
+    return ( energy , kpoints , spinUpCoeff , spinDownCoeff )
 
 class LogWignerCrystalSlater(Wavefunction):
     """
