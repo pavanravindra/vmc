@@ -825,10 +825,14 @@ class LogBDSJB(Wavefunction):
         self.Fb2t = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
 
         self.backflowLinear1 = nn.Dense(self.hiddenFeatures)
-        self.backflowLinear2 = nn.Dense(self.dim)
+        self.backflowLinear2 = nn.Dense(
+            self.dim, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
+        )
 
         self.jastrowLinear1 = nn.Dense(self.hiddenFeatures)
-        self.jastrowLinear2 = nn.Dense(1)
+        self.jastrowLinear2 = nn.Dense(
+            1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
+        )
 
     def __call__(self, rs):
 
