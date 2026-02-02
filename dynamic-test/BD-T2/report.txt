@@ -1,0 +1,8 @@
+r_ws	Best Energy		Median Energy		Converges
+10	-8.51501949e-02		inf		7 / 16
+20	-4.60296250e-02		inf		1 / 16
+30			inf		0 / 16
+40			inf		0 / 16
+50			inf		0 / 16
+
+8 / 80 runs converged
