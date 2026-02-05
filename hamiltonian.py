@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Callable, Any, Tuple, Union
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +33,7 @@ def vmap_chunked(
         if not mapped_pos:
             return g(*args)
 
-        nw = _batch_size0(args[mapped_pos[0]])
+        nw = args[mapped_pos[0]].shape[0]
         batch_size = (nw + n_chunks - 1) // n_chunks
 
         mapped_args = tuple(args[i] for i in mapped_pos)
@@ -86,7 +87,7 @@ def laplacian(logWavefunction, parameters, rs):
         return hv[i]
 
     diag = jax.vmap(second_deriv)(jnp.arange(D, dtype=jnp.int32))  # float32
-    #return jnp.sum(diag) # sum seems numerically unstable in float32?
+    # return jnp.sum(diag) # sum seems numerically unstable in float32?
     # Basically the sum contains a few very large numbers on a different order
     #     than the rest of the numbers
 
