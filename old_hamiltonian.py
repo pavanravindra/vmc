@@ -1,99 +1,36 @@
-from dataclasses import dataclass
-from typing import Callable, Any, Tuple, Union
-
 import jax
 import jax.numpy as jnp
 
-def vmap_chunked(
-    fn: Callable[..., Any],
-    n_chunks: int,
-    *,
-    in_axes: Union[int, Tuple[Union[int, None], ...]] = 0,
-):
-    """
-    Memory friendly vmap: map over axis-0 in micro-batches using lax.map.
-
-    Usage like vmap:
-        out = vmap_chunked(fn, n_chunks, in_axes=...)(*args, **kwargs)
-    """
-
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        g = lambda *a: fn(*a, **kwargs)
-
-        if n_chunks == 1:
-            return jax.vmap(g, in_axes=in_axes)(*args)
-
-        if not isinstance(in_axes, tuple):
-            in_axes_ = (in_axes,) * len(args)
-        else:
-            in_axes_ = in_axes
-
-        mapped_pos = [i for i, ax in enumerate(in_axes_) if ax == 0]
-        if not mapped_pos:
-            return g(*args)
-
-        nw = _batch_size0(args[mapped_pos[0]])
-        batch_size = (nw + n_chunks - 1) // n_chunks
-
-        mapped_args = tuple(args[i] for i in mapped_pos)
-
-        def f(xi):
-            full = list(args)
-            for j, i in enumerate(mapped_pos):
-                full[i] = xi[j]
-            return g(*full)
-
-        return jax.lax.map(f, mapped_args, batch_size=batch_size)
-
-    return wrapped
+import itertools
 
 class LocalEnergy:
-    def configuration(self, parameters, rs):
-        raise NotImplementedError
-
-@dataclass
-class Batched(LocalEnergy):
-    term: LocalEnergy
-    n_chunks: int = 1
-    in_axes: tuple = (None, 0)
-
+    
     def batch(self, parameters, walkerRs):
-        mapper = vmap_chunked(self.term.configuration, self.n_chunks, in_axes=self.in_axes)
-        return mapper(parameters, walkerRs)
-
-    def configuration(self, parameters, rs):
-        return self.term.configuration(parameters, rs)
+        batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
+        return batchFunction(parameters, walkerRs)
 
 def laplacian(logWavefunction, parameters, rs):
     """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-heavy way.
-
-    The Laplacian is computed all at once so this is very fast, but if you try
-    to vmap this over all 1024 walkers, you will certainly run out of memory.
-
-    The chunked `vmap` approach in `Batched` is designed to handle this issue.
+    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
+    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
+    the sum over coordinates without blowing up memory.
     """
-
-    def f_rs(x):
-        return logWavefunction(parameters, x)
+    def f_rs(rs):
+        return logWavefunction(parameters, rs)
 
     grad_fn = jax.grad(f_rs)
-    D = rs.size
+    rsFlat = rs.reshape(-1)
+    numCoords = rsFlat.size
 
-    def second_deriv(i):
-        v = jax.nn.one_hot(i, D, dtype=rs.dtype).reshape(rs.shape)
-        hv = jax.jvp(grad_fn, (rs,), (v,))[1].reshape(-1)
-        return hv[i]
+    def body(carry, i):
+        e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
+        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
+        lap = carry + secondDerivative
+        return ( lap , None )
 
-    diag = jax.vmap(second_deriv)(jnp.arange(D, dtype=jnp.int32))  # float32
-    #return jnp.sum(diag) # sum seems numerically unstable in float32?
-    # Basically the sum contains a few very large numbers on a different order
-    #     than the rest of the numbers
-
-    # Compute sum in float64 since it's more stable
-    diag64 = diag.astype(jnp.float64)
-    lap64 = jax.lax.fori_loop(0, D, lambda i, acc: acc + diag64[i], jnp.float64(0.0))
-    return lap64.astype(rs.dtype)
+    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+    
+    return lap
 
 class LocalKineticEnergy(LocalEnergy):
     """
@@ -108,7 +45,7 @@ class LocalKineticEnergy(LocalEnergy):
         grad2f = laplacian(self.logWavefunction, parameters, rs)
 
         gradFunction = jax.grad(self.logWavefunction, argnums=1)
-        grad = gradFunction(parameters, rs)  # shape (N, D)
+        grad = gradFunction(parameters, rs)  # shape (N, 3)
         gradf2 = jnp.sum(grad ** 2)
 
         kineticEnergy = -0.5 * (grad2f + gradf2)
@@ -237,53 +174,24 @@ class EwaldPotential2D(LocalEnergy):
         return 0.5 * jnp.sum(vals) + 0.5 * N * self.madelung_const
 
 class LocalEnergyUEG(LocalEnergy):
-    def __init__(
-        self,
-        logWavefunction,
-        lattice,
-        truncationLimit=2,
-        kinetic_chunks: int = 1,
-        potential_chunks: int = 1,
-    ):
-        kinetic = LocalKineticEnergy(logWavefunction)
-        potential = EwaldPotential(lattice, truncationLimit)
 
-        self.kinetic = Batched(kinetic, n_chunks=kinetic_chunks)
-        self.potential = Batched(potential, n_chunks=potential_chunks)
-
-    def batch(self, parameters, walkerRs):
-        ke = self.kinetic.batch(parameters, walkerRs)
-        pe = self.potential.batch(parameters, walkerRs)
-        return ke + pe
+    def __init__(self, logWavefunction, lattice, truncationLimit=2):
+        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
+        self.potentialEnergy = EwaldPotential(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
-        return (
-            self.kinetic.configuration(parameters, rs)
-            + self.potential.configuration(parameters, rs)
-        )
+        kineticEnergy = self.kineticEnergy.configuration(parameters, rs)
+        potentialEnergy = self.potentialEnergy.configuration(parameters, rs)
+        return kineticEnergy + potentialEnergy
 
 class LocalEnergyUEG2D(LocalEnergy):
-    def __init__(
-        self,
-        logWavefunction,
-        lattice,
-        truncationLimit=2,
-        kinetic_chunks: int = 1,
-        potential_chunks: int = 1,
-    ):
-        kinetic = LocalKineticEnergy(logWavefunction)
-        potential = EwaldPotential2D(lattice, truncationLimit)
 
-        self.kinetic = Batched(kinetic, n_chunks=kinetic_chunks)
-        self.potential = Batched(potential, n_chunks=potential_chunks)
-
-    def batch(self, parameters, walkerRs):
-        ke = self.kinetic.batch(parameters, walkerRs)
-        pe = self.potential.batch(parameters, walkerRs)
-        return ke + pe
+    def __init__(self, logWavefunction, lattice, truncationLimit=2):
+        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
+        self.potentialEnergy = EwaldPotential2D(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
-        return (
-            self.kinetic.configuration(parameters, rs)
-            + self.potential.configuration(parameters, rs)
-        )
+        kineticEnergy = self.kineticEnergy.configuration(parameters, rs)
+        potentialEnergy = self.potentialEnergy.configuration(parameters, rs)
+        return kineticEnergy + potentialEnergy
+        
