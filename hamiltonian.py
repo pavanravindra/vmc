@@ -5,17 +5,17 @@ import itertools
 import jax
 import jax.numpy as jnp
 
+InAxes = Union[int, Tuple[Union[int, None], ...]]
+
 def vmap_chunked(
     fn: Callable[..., Any],
     n_chunks: int,
     *,
-    in_axes: Union[int, Tuple[Union[int, None], ...]] = 0,
+    in_axes: InAxes = 0,
 ):
     """
-    Memory friendly vmap: map over axis-0 in micro-batches using lax.map.
-
-    Usage like vmap:
-        out = vmap_chunked(fn, n_chunks, in_axes=...)(*args, **kwargs)
+    Memory-safe vmap over axis-0 using explicit chunking.
+    Works on all JAX versions.
     """
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -24,6 +24,7 @@ def vmap_chunked(
         if n_chunks == 1:
             return jax.vmap(g, in_axes=in_axes)(*args)
 
+        # normalize in_axes
         if not isinstance(in_axes, tuple):
             in_axes_ = (in_axes,) * len(args)
         else:
@@ -34,17 +35,35 @@ def vmap_chunked(
             return g(*args)
 
         nw = args[mapped_pos[0]].shape[0]
-        batch_size = (nw + n_chunks - 1) // n_chunks
+        chunk_size = (nw + n_chunks - 1) // n_chunks
+        padded_n = chunk_size * n_chunks
+        pad = padded_n - nw
 
-        mapped_args = tuple(args[i] for i in mapped_pos)
+        def pad0(x):
+            pad_width = [(0, 0)] * x.ndim
+            pad_width[0] = (0, pad)
+            return jnp.pad(x, pad_width, mode="constant")
 
-        def f(xi):
+        def reshape_chunks(x):
+            return x.reshape((n_chunks, chunk_size) + x.shape[1:])
+
+        # prepare chunked inputs
+        chunked_args = []
+        for i in mapped_pos:
+            chunked_args.append(reshape_chunks(pad0(args[i])))
+
+        def run_chunk(chunk_idx):
             full = list(args)
             for j, i in enumerate(mapped_pos):
-                full[i] = xi[j]
-            return g(*full)
+                full[i] = chunked_args[j][chunk_idx]
+            return jax.vmap(g, in_axes=in_axes_)(*full)
 
-        return jax.lax.map(f, mapped_args, batch_size=batch_size)
+        out = lax.map(run_chunk, jnp.arange(n_chunks))
+        out = jax.tree_util.tree_map(
+            lambda x: x.reshape((padded_n,) + x.shape[2:])[:nw],
+            out,
+        )
+        return out
 
     return wrapped
 
@@ -86,15 +105,13 @@ def laplacian(logWavefunction, parameters, rs):
         hv = jax.jvp(grad_fn, (rs,), (v,))[1].reshape(-1)
         return hv[i]
 
-    diag = jax.vmap(second_deriv)(jnp.arange(D, dtype=jnp.int32))  # float32
-    # return jnp.sum(diag) # sum seems numerically unstable in float32?
-    # Basically the sum contains a few very large numbers on a different order
-    #     than the rest of the numbers
+    # TODO: worth checking if results change significantly with just:
+    #         `lap = jnp.sum(diag)`
+    # Current implementation is more "numerically stable" it seems...
 
-    # Compute sum in float64 since it's more stable
-    diag64 = diag.astype(jnp.float64)
-    lap64 = jax.lax.fori_loop(0, D, lambda i, acc: acc + diag64[i], jnp.float64(0.0))
-    return lap64.astype(rs.dtype)
+    diag = jax.vmap(second_deriv)(jnp.arange(D, dtype=jnp.int32))
+    lap = jax.lax.fori_loop(0, D, lambda i, acc: acc + diag[i], 0.0)
+    return lap
 
 class LocalKineticEnergy(LocalEnergy):
     """
