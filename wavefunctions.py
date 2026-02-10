@@ -425,6 +425,26 @@ class LogFixedCYJastrow(Wavefunction):
             rs, self.spins, self.lattice, self.rec_lattice, self.As
         )
 
+class LogSimpleSlaters(Wavefunction):
+    """
+    Creates a log-wavefunction that is the product of two simple Slater
+    determinant with the lowest k-points filled.
+
+    There are no variational parameters.
+    """
+    spins : (int,int)
+    dim : int
+    kpoints : jnp.ndarray
+
+    def setup(self):
+        self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
+        self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
+
+    def __call__(self, rs):
+        slaterUp = self.slaterUp(rs[:self.spins[0],:])
+        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+        return slaterUp + slaterDown
+
 class LogSlaterCYJastrow(Wavefunction):
     """
     Creates a log-wavefunction that is the product of two simple Slater
