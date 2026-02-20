@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
 
+import folx
+
 import itertools
 
 class LocalEnergy:
@@ -9,46 +11,33 @@ class LocalEnergy:
         batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
         return batchFunction(parameters, walkerRs)
 
-def laplacian(logWavefunction, parameters, rs):
-    """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
-    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
-    the sum over coordinates without blowing up memory.
-    """
-    def f_rs(rs):
-        return logWavefunction(parameters, rs)
-
-    grad_fn = jax.grad(f_rs)
-    rsFlat = rs.reshape(-1)
-    numCoords = rsFlat.size
-
-    def body(carry, i):
-        e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
-        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
-
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
-    
-    return lap
-
 class LocalKineticEnergy(LocalEnergy):
     """
-    Computes the local kinetic energy of an arbitrary log wavefunction.
+    Computes the local kinetic energy of an arbitrary log wavefunction using
+    Microsoft's implementation of forward-pass Laplacian computation.
+
+    TODO: Add formula for convenience...
     """
 
-    def __init__(self, logWavefunction):
+    def __init__(self, logWavefunction, sparsity_threshold):
         self.logWavefunction = logWavefunction.apply
+        self.sparsity_threshold = sparsity_threshold
 
     def configuration(self, parameters, rs):
 
-        grad2f = laplacian(self.logWavefunction, parameters, rs)
+        def f_rs(x):
+            return self.logWavefunction(parameters, x)
 
-        gradFunction = jax.grad(self.logWavefunction, argnums=1)
-        grad = gradFunction(parameters, rs)  # shape (N, 3)
-        gradf2 = jnp.sum(grad ** 2)
+        folx_function = folx.forward_laplacian(
+            f_rs, sparsity_threshold=self.sparsity_threshold
+        )
+        folx_output = folx_function(rs)
+        
+        lap = folx_output.laplacian
+        jacobian = folx_output[1].dense_array
+        gradf2 = jnp.sum(jacobian ** 2)
 
-        kineticEnergy = -0.5 * (grad2f + gradf2)
+        kineticEnergy = -0.5 * (gradf2 + lap)
         
         return kineticEnergy
 
@@ -186,8 +175,8 @@ class LocalEnergyUEG(LocalEnergy):
 
 class LocalEnergyUEG2D(LocalEnergy):
 
-    def __init__(self, logWavefunction, lattice, truncationLimit=2):
-        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
+    def __init__(self, logWavefunction, lattice, sparsity_threshold, truncationLimit=2):
+        self.kineticEnergy = LocalKineticEnergy(logWavefunction, sparsity_threshold)
         self.potentialEnergy = EwaldPotential2D(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):

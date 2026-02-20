@@ -9,28 +9,28 @@ class LocalEnergy:
         batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
         return batchFunction(parameters, walkerRs)
 
-def laplacian(logWavefunction, parameters, rs):
+def laplacian_hutchinson(logWavefunction, parameters, rs, rng, n_probes=1000):
     """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
-    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
-    the sum over coordinates without blowing up memory.
+    TODO
     """
     def f_rs(rs):
         return logWavefunction(parameters, rs)
 
-    grad_fn = jax.grad(f_rs)
-    rsFlat = rs.reshape(-1)
-    numCoords = rsFlat.size
+    # Build a linearized map v -> H v for H = Hessian(f) at rs
+    # linearize(grad f) gives you an efficient HVP closure at this rs
+    grad_f = jax.grad(f_rs)
+    g0, hvp = jax.linearize(grad_f, rs)         # g0 == g, hvp(v) == H v
 
-    def body(carry, i):
-        e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
-        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
+    # Hutchinson trace estimate: mean_i z_i^T H z_i
+    def one_probe(key):
+        z = jax.random.rademacher(key, shape=rs.shape, dtype=rs.dtype)
+        Hz = hvp(z)                              # (N, dim)
+        return jnp.sum(z * Hz)                   # scalar = z^T H z
 
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
-    
-    return lap
+    keys = jax.random.split(rng, n_probes)
+    trH_est = jnp.mean(jax.vmap(one_probe)(keys))  # scalar
+
+    return trH_est
 
 class LocalKineticEnergy(LocalEnergy):
     """
@@ -40,9 +40,9 @@ class LocalKineticEnergy(LocalEnergy):
     def __init__(self, logWavefunction):
         self.logWavefunction = logWavefunction.apply
 
-    def configuration(self, parameters, rs):
+    def configuration(self, parameters, rs, rng):
 
-        grad2f = laplacian(self.logWavefunction, parameters, rs)
+        grad2f = laplacian_hutchinson(self.logWavefunction, parameters, rs, rng)
 
         gradFunction = jax.grad(self.logWavefunction, argnums=1)
         grad = gradFunction(parameters, rs)  # shape (N, 3)

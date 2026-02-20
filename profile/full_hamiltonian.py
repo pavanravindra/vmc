@@ -22,14 +22,19 @@ def laplacian(logWavefunction, parameters, rs):
     rsFlat = rs.reshape(-1)
     numCoords = rsFlat.size
 
-    def body(carry, i):
+    #def body(carry, i):
+    def body(i):
         e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
         secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
-
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+        # lap = carry + secondDerivative
+        # return ( lap , None )
+        return secondDerivative
     
+    # lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+    # return lap
+
+    secondDerivatives = jax.vmap(body)(jnp.arange(numCoords))
+    lap = jnp.sum(secondDerivatives)
     return lap
 
 class LocalKineticEnergy(LocalEnergy):

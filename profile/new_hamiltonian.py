@@ -9,32 +9,11 @@ class LocalEnergy:
         batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
         return batchFunction(parameters, walkerRs)
 
-def laplacian(logWavefunction, parameters, rs):
-    """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
-    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
-    the sum over coordinates without blowing up memory.
-    """
-    def f_rs(rs):
-        return logWavefunction(parameters, rs)
-
-    grad_fn = jax.grad(f_rs)
-    rsFlat = rs.reshape(-1)
-    numCoords = rsFlat.size
-
-    def body(carry, i):
-        e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
-        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
-
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
-    
-    return lap
-
 class LocalKineticEnergy(LocalEnergy):
     """
     Computes the local kinetic energy of an arbitrary log wavefunction.
+
+    TODO: Add formula for convenience...
     """
 
     def __init__(self, logWavefunction):
@@ -42,13 +21,30 @@ class LocalKineticEnergy(LocalEnergy):
 
     def configuration(self, parameters, rs):
 
-        grad2f = laplacian(self.logWavefunction, parameters, rs)
+        def f_rs(x):
+            return self.logWavefunction(parameters, x)
 
-        gradFunction = jax.grad(self.logWavefunction, argnums=1)
-        grad = gradFunction(parameters, rs)  # shape (N, 3)
-        gradf2 = jnp.sum(grad ** 2)
+        gradFunction = jax.grad(f_rs)
+        primals, hvp = jax.linearize(gradFunction, rs)
 
-        kineticEnergy = -0.5 * (grad2f + gradf2)
+        gradf2 = jnp.sum(primals ** 2)
+
+        D = rs.size
+
+        def for_body(i, acc):
+            e_i = jax.nn.one_hot(i, D, dtype=rs.dtype)
+            He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+            return acc + He[i]
+
+        def map_body(i):
+            e_i = jax.nn.one_hot(i, D, dtype=rs.dtype)
+            He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+            return He[i]
+
+        lap = jax.lax.fori_loop(0, D, for_body, jnp.array(0.0, dtype=rs.dtype))
+        #lap = jnp.sum(jax.vmap(map_body)(jnp.arange(D)))
+
+        kineticEnergy = -0.5 * (gradf2 + lap)
         
         return kineticEnergy
 

@@ -1,19 +1,100 @@
+from dataclasses import dataclass
+from typing import Callable, Any, Tuple, Union
+import itertools
+
 import jax
 import jax.numpy as jnp
 
-import itertools
+InAxes = Union[int, Tuple[Union[int, None], ...]]
+
+def vmap_chunked(
+    fn: Callable[..., Any],
+    n_chunks: int,
+    *,
+    in_axes: InAxes = 0,
+):
+    """
+    Memory-friendly vmap: evaluate over axis-0 in micro-batches using lax.map,
+    without relying on lax.map(batch_size=...).
+
+    - Chunks arguments with in_axes == 0 along axis 0.
+    - Other args are broadcast/kept as in regular vmap.
+    - Works under jit.
+
+    Usage:
+        out = vmap_chunked(fn, n_chunks, in_axes=...)(*args, **kwargs)
+    """
+
+    def wrapped(*args, **kwargs):
+        g = lambda *a: fn(*a, **kwargs)
+
+        if n_chunks == 1:
+            return jax.vmap(g, in_axes=in_axes)(*args)
+
+        # Normalize in_axes to a tuple
+        if not isinstance(in_axes, tuple):
+            in_axes_ = (in_axes,) * len(args)
+        else:
+            in_axes_ = in_axes
+
+        mapped_pos = [i for i, ax in enumerate(in_axes_) if ax == 0]
+        if not mapped_pos:
+            return g(*args)
+
+        nw = args[mapped_pos[0]].shape[0]
+        chunk = (nw + n_chunks - 1) // n_chunks  # ceil
+
+        # number of chunks we will actually execute
+        n_chunks_eff = (nw + chunk - 1) // chunk
+
+        # fixed offsets [0, 1, ..., chunk-1] (STATIC length = chunk)
+        offsets = jnp.arange(chunk)
+
+        # chunk start indices [0, chunk, 2*chunk, ...] (length = n_chunks_eff)
+        starts = jnp.arange(n_chunks_eff) * chunk
+
+        def run_chunk(start):
+            # Build fixed-size indices: start + offsets, then clip into [0, nw-1]
+            idx = jnp.minimum(start + offsets, nw - 1)
+
+            full = list(args)
+            for i in mapped_pos:
+                full[i] = jnp.take(full[i], idx, axis=0)
+
+            # Evaluate on the full chunk size (last chunk is padded by clipping)
+            return jax.vmap(g, in_axes=in_axes)(*full)
+
+        outs = jax.lax.map(run_chunk, starts)
+
+        # outs has shape (n_chunks_eff, chunk, ...)
+        # reshape to (n_chunks_eff*chunk, ...) then slice back to nw
+        return jax.tree_util.tree_map(
+            lambda x: x.reshape((n_chunks_eff * chunk,) + x.shape[2:])[:nw],
+            outs,
+        )
+
+    return wrapped
 
 class LocalEnergy:
-    
+    def configuration(self, parameters, rs):
+        raise NotImplementedError
+
+@dataclass
+class Batched(LocalEnergy):
+    term: LocalEnergy
+    n_chunks: int = 1
+    in_axes: tuple = (None, 0)
+
     def batch(self, parameters, walkerRs):
-        batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
-        return batchFunction(parameters, walkerRs)
+        mapper = vmap_chunked(self.term.configuration, self.n_chunks, in_axes=self.in_axes)
+        return mapper(parameters, walkerRs)
+
+    def configuration(self, parameters, rs):
+        return self.term.configuration(parameters, rs)
 
 def laplacian(logWavefunction, parameters, rs):
     """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
-    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
-    the sum over coordinates without blowing up memory.
+    TODO
     """
     def f_rs(rs):
         return logWavefunction(parameters, rs)
@@ -22,15 +103,66 @@ def laplacian(logWavefunction, parameters, rs):
     rsFlat = rs.reshape(-1)
     numCoords = rsFlat.size
 
-    def body(carry, i):
+    #def body(carry, i):
+    def body(i):
         e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
         secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
-
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+        # lap = carry + secondDerivative
+        # return ( lap , None )
+        return secondDerivative
     
+    # lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+    # return lap
+
+    secondDerivatives = jax.vmap(body)(jnp.arange(numCoords))
+    lap = jnp.sum(secondDerivatives)
     return lap
+
+def linear_laplacian(logWavefunction, parameters, rs):
+    """
+    TODO: cleanup description
+
+    Computes Laplacian of logWavefunction(parameters, rs) w.r.t. rs using
+    jax.linearize, and vmaps over all coordinate basis directions.
+
+    This is NOT memory-friendly (creates (D, D) intermediates implicitly), but is
+    useful for debugging / correctness checks.
+
+    Args:
+      logWavefunction: callable (parameters, rs) -> scalar
+      parameters: pytree
+      rs: array (N, dim) (or any shape); Laplacian taken over all entries
+
+    Returns:
+      lap: scalar, sum of second partial derivatives over all coordinates
+    """
+    def f(x):
+        return logWavefunction(parameters, x)
+
+    grad_f = jax.grad(f)
+    _, hvp = jax.linearize(grad_f, rs)  # hvp(v) = H v at rs
+
+    D = rs.size
+    dtype = rs.dtype
+
+    # Basis vectors in flattened space: shape (D, D)
+    E = jnp.eye(D, dtype=dtype)
+
+    def diag_entry(e_i):
+        # H e_i as a flat vector
+        He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+        # pick i-th component = e_i^T H e_i
+        i = jnp.argmax(e_i)  # works since e_i is one-hot
+        return He[i]
+
+    # Better: avoid argmax by vmapping over indices directly
+    def diag_entry_from_i(i):
+        e_i = jax.nn.one_hot(i, D, dtype=dtype)
+        He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+        return He[i]
+
+    diag = jax.vmap(diag_entry_from_i)(jnp.arange(D, dtype=jnp.int32))
+    return jnp.sum(diag)
 
 class LocalKineticEnergy(LocalEnergy):
     """
@@ -42,10 +174,10 @@ class LocalKineticEnergy(LocalEnergy):
 
     def configuration(self, parameters, rs):
 
-        grad2f = laplacian(self.logWavefunction, parameters, rs)
+        grad2f = linear_laplacian(self.logWavefunction, parameters, rs)
 
         gradFunction = jax.grad(self.logWavefunction, argnums=1)
-        grad = gradFunction(parameters, rs)  # shape (N, 3)
+        grad = gradFunction(parameters, rs)  # shape (N, D)
         gradf2 = jnp.sum(grad ** 2)
 
         kineticEnergy = -0.5 * (grad2f + gradf2)
@@ -174,24 +306,53 @@ class EwaldPotential2D(LocalEnergy):
         return 0.5 * jnp.sum(vals) + 0.5 * N * self.madelung_const
 
 class LocalEnergyUEG(LocalEnergy):
+    def __init__(
+        self,
+        logWavefunction,
+        lattice,
+        truncationLimit=2,
+        kinetic_chunks: int = 1,
+        potential_chunks: int = 1,
+    ):
+        kinetic = LocalKineticEnergy(logWavefunction)
+        potential = EwaldPotential(lattice, truncationLimit)
 
-    def __init__(self, logWavefunction, lattice, truncationLimit=2):
-        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
-        self.potentialEnergy = EwaldPotential(lattice, truncationLimit)
+        self.kinetic = Batched(kinetic, n_chunks=kinetic_chunks)
+        self.potential = Batched(potential, n_chunks=potential_chunks)
+
+    def batch(self, parameters, walkerRs):
+        ke = self.kinetic.batch(parameters, walkerRs)
+        pe = self.potential.batch(parameters, walkerRs)
+        return ke + pe
 
     def configuration(self, parameters, rs):
-        kineticEnergy = self.kineticEnergy.configuration(parameters, rs)
-        potentialEnergy = self.potentialEnergy.configuration(parameters, rs)
-        return kineticEnergy + potentialEnergy
+        return (
+            self.kinetic.configuration(parameters, rs)
+            + self.potential.configuration(parameters, rs)
+        )
 
 class LocalEnergyUEG2D(LocalEnergy):
+    def __init__(
+        self,
+        logWavefunction,
+        lattice,
+        truncationLimit=2,
+        kinetic_chunks: int = 1,
+        potential_chunks: int = 1,
+    ):
+        kinetic = LocalKineticEnergy(logWavefunction)
+        potential = EwaldPotential2D(lattice, truncationLimit)
 
-    def __init__(self, logWavefunction, lattice, truncationLimit=2):
-        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
-        self.potentialEnergy = EwaldPotential2D(lattice, truncationLimit)
+        self.kinetic = Batched(kinetic, n_chunks=kinetic_chunks)
+        self.potential = Batched(potential, n_chunks=potential_chunks)
+
+    def batch(self, parameters, walkerRs):
+        ke = self.kinetic.batch(parameters, walkerRs)
+        pe = self.potential.batch(parameters, walkerRs)
+        return ke + pe
 
     def configuration(self, parameters, rs):
-        kineticEnergy = self.kineticEnergy.configuration(parameters, rs)
-        potentialEnergy = self.potentialEnergy.configuration(parameters, rs)
-        return kineticEnergy + potentialEnergy
-        
+        return (
+            self.kinetic.configuration(parameters, rs)
+            + self.potential.configuration(parameters, rs)
+        )

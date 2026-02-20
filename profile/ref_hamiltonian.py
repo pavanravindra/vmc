@@ -3,10 +3,74 @@ import jax.numpy as jnp
 
 import itertools
 
+def vmap_chunked(fn, n_chunks, *, in_axes=0):
+    """
+    Memory-friendly vmap: evaluate over axis-0 in micro-batches using lax.map,
+    without relying on lax.map(batch_size=...).
+
+    - Chunks arguments with in_axes == 0 along axis 0.
+    - Other args are broadcast/kept as in regular vmap.
+    - Works under jit.
+
+    Usage:
+        out = vmap_chunked(fn, n_chunks, in_axes=...)(*args, **kwargs)
+    """
+
+    def wrapped(*args, **kwargs):
+        g = lambda *a: fn(*a, **kwargs)
+
+        if n_chunks == 1:
+            return jax.vmap(g, in_axes=in_axes)(*args)
+
+        # Normalize in_axes to a tuple
+        if not isinstance(in_axes, tuple):
+            in_axes_ = (in_axes,) * len(args)
+        else:
+            in_axes_ = in_axes
+
+        mapped_pos = [i for i, ax in enumerate(in_axes_) if ax == 0]
+        if not mapped_pos:
+            return g(*args)
+
+        nw = args[mapped_pos[0]].shape[0]
+        chunk = (nw + n_chunks - 1) // n_chunks  # ceil
+
+        # number of chunks we will actually execute
+        n_chunks_eff = (nw + chunk - 1) // chunk
+
+        # fixed offsets [0, 1, ..., chunk-1] (STATIC length = chunk)
+        offsets = jnp.arange(chunk)
+
+        # chunk start indices [0, chunk, 2*chunk, ...] (length = n_chunks_eff)
+        starts = jnp.arange(n_chunks_eff) * chunk
+
+        def run_chunk(start):
+            # Build fixed-size indices: start + offsets, then clip into [0, nw-1]
+            idx = jnp.minimum(start + offsets, nw - 1)
+
+            full = list(args)
+            for i in mapped_pos:
+                full[i] = jnp.take(full[i], idx, axis=0)
+
+            # Evaluate on the full chunk size (last chunk is padded by clipping)
+            return jax.vmap(g, in_axes=in_axes)(*full)
+
+        outs = jax.lax.map(run_chunk, starts)
+
+        # outs has shape (n_chunks_eff, chunk, ...)
+        # reshape to (n_chunks_eff*chunk, ...) then slice back to nw
+        return jax.tree_util.tree_map(
+            lambda x: x.reshape((n_chunks_eff * chunk,) + x.shape[2:])[:nw],
+            outs,
+        )
+
+    return wrapped
+
 class LocalEnergy:
     
     def batch(self, parameters, walkerRs):
-        batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
+        #batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
+        batchFunction = vmap_chunked(self.configuration, n_chunks=1, in_axes=(None,0))
         return batchFunction(parameters, walkerRs)
 
 def laplacian(logWavefunction, parameters, rs):
@@ -22,14 +86,19 @@ def laplacian(logWavefunction, parameters, rs):
     rsFlat = rs.reshape(-1)
     numCoords = rsFlat.size
 
-    def body(carry, i):
+    #def body(carry, i):
+    def body(i):
         e_i = jnp.eye(numCoords)[i].reshape(rs.shape)
         secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        lap = carry + secondDerivative
-        return ( lap , None )
-
-    lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+        # lap = carry + secondDerivative
+        # return ( lap , None )
+        return secondDerivative
     
+    # lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
+    # return lap
+
+    secondDerivatives = jax.vmap(body)(jnp.arange(numCoords))
+    lap = jnp.sum(secondDerivatives)
     return lap
 
 class LocalKineticEnergy(LocalEnergy):

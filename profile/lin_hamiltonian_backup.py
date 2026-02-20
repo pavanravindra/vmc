@@ -11,37 +11,46 @@ class LocalEnergy:
 
 def laplacian(logWavefunction, parameters, rs):
     """
-    Computes the Laplacian of logWavefunction w.r.t. rs in a memory-efficient
-    way. Uses forward-over-reverse AD (jax.jvp) and jax.lax.scan to accumulate
-    the sum over coordinates without blowing up memory.
+    Computes Laplacian of logWavefunction(parameters, rs) w.r.t. rs using
+    jax.linearize, and vmaps over all coordinate basis directions.
+
+    This is NOT memory-friendly (creates (D, D) intermediates implicitly), but is
+    useful for debugging / correctness checks.
+
+    Args:
+      logWavefunction: callable (parameters, rs) -> scalar
+      parameters: pytree
+      rs: array (N, dim) (or any shape); Laplacian taken over all entries
+
+    Returns:
+      lap: scalar, sum of second partial derivatives over all coordinates
     """
-    def f_rs(rs):
-        return logWavefunction(parameters, rs)
+    def f(x):
+        return logWavefunction(parameters, x)
 
-    grad_fn = jax.grad(f_rs)
-    rsFlat = rs.reshape(-1)
-    numCoords = rsFlat.size
+    grad_f = jax.grad(f)
+    _, hvp = jax.linearize(grad_f, rs)  # hvp(v) = H v at rs
 
-    #def body(carry, i):
-    def body(i):
-        e_i = jax.nn.one_hot(i, numCoords, dtype=rs.dtype).reshape(rs.shape)
-        secondDerivative = jax.jvp(grad_fn, (rs,), (e_i,))[1].reshape(-1)[i]
-        #lap = carry + secondDerivative
-        #return ( lap , None )
-        return secondDerivative
+    D = rs.size
+    dtype = rs.dtype
 
-    #lap, _ = jax.lax.scan(body, 0.0, jnp.arange(numCoords))
-    sds = jax.vmap(body)(jnp.arange(numCoords))
-    #lap, _ = jax.lax.scan(
-    #    lambda x, y: (x+y,None),
-    #    0.0, sds
-    #)
-    lap = jnp.sum(sds)
+    # Basis vectors in flattened space: shape (D, D)
+    E = jnp.eye(D, dtype=dtype)
 
-    print("INSIDE LAPLACIAN:\t{}".format(sds))
-    print("INSIDE LAPLACIAN:\t{}".format(-jnp.sum(sds)/2))
-    
-    return lap
+    def diag_entry(e_i):
+        # H e_i as a flat vector
+        He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+        # pick i-th component = e_i^T H e_i
+        i = jnp.argmax(e_i)  # works since e_i is one-hot
+        return He[i]
+
+    def diag_entry_from_i(i):
+        e_i = jax.nn.one_hot(i, D, dtype=dtype)
+        He = hvp(e_i.reshape(rs.shape)).reshape(-1)
+        return He[i]
+
+    diag = jax.vmap(diag_entry_from_i)(jnp.arange(D, dtype=jnp.int32))
+    return jnp.sum(diag)
 
 class LocalKineticEnergy(LocalEnergy):
     """
@@ -60,9 +69,6 @@ class LocalKineticEnergy(LocalEnergy):
         gradf2 = jnp.sum(grad ** 2)
 
         kineticEnergy = -0.5 * (grad2f + gradf2)
-
-        print("INSIDE KE:\t{}\t{}".format(-grad2f/2, -gradf2/2))
-        print("INSIDE KE:\t{}".format(kineticEnergy))
         
         return kineticEnergy
 
