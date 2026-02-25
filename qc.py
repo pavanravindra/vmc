@@ -4,7 +4,7 @@ import jax.scipy as jsp
 
 import numpy as np
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple, Optional
 from functools import partial
 import itertools
@@ -17,7 +17,7 @@ class ueg:
 
     basis: Optional[jax.Array] = None
     
-    rec_basis: jax.Array = jnp.zeros((3,3)) # Rows are b1, b2...
+    rec_basis: "jax.Array" = field(default_factory=lambda: jnp.zeros((3, 3))) # Rows are b1, b2, ...
     volume: float = 0.0  
     n_particles: int = 0
     density: float = 0.0
