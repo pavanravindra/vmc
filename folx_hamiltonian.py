@@ -1,48 +1,43 @@
 import jax
 import jax.numpy as jnp
 
+import folx
+
 import itertools
 
 class LocalEnergy:
     
     def batch(self, parameters, walkerRs):
-        batchFunction = jax.vmap(self.configuration, in_axes=(None,0))
+        batchFunction = folx.batched_vmap(
+            self.configuration, in_axes=(None,0), max_batch_size=64
+        )
         return batchFunction(parameters, walkerRs)
 
 class LocalKineticEnergy(LocalEnergy):
     """
-    Computes the local kinetic energy of an arbitrary log wavefunction.
+    Computes the local kinetic energy of an arbitrary log wavefunction using
+    Microsoft's implementation of forward-pass Laplacian computation.
 
     TODO: Add formula for convenience...
     """
 
-    def __init__(self, logWavefunction):
+    def __init__(self, logWavefunction, sparsity_threshold):
         self.logWavefunction = logWavefunction.apply
+        self.sparsity_threshold = sparsity_threshold
 
     def configuration(self, parameters, rs):
 
         def f_rs(x):
             return self.logWavefunction(parameters, x)
 
-        gradFunction = jax.grad(f_rs)
-        primals, hvp = jax.linearize(gradFunction, rs)
-
-        gradf2 = jnp.sum(primals ** 2)
-
-        D = rs.size
-
-        def for_body(i, acc):
-            e_i = jax.nn.one_hot(i, D, dtype=rs.dtype)
-            He = hvp(e_i.reshape(rs.shape)).reshape(-1)
-            return acc + He[i]
-
-        def map_body(i):
-            e_i = jax.nn.one_hot(i, D, dtype=rs.dtype)
-            He = hvp(e_i.reshape(rs.shape)).reshape(-1)
-            return He[i]
-
-        lap = jax.lax.fori_loop(0, D, for_body, jnp.array(0.0, dtype=rs.dtype))
-        #lap = jnp.sum(jax.vmap(map_body)(jnp.arange(D)))
+        folx_function = folx.forward_laplacian(
+            f_rs, sparsity_threshold=self.sparsity_threshold
+        )
+        folx_output = folx_function(rs)
+        
+        lap = folx_output.laplacian
+        jacobian = folx_output[1].dense_array
+        gradf2 = jnp.sum(jacobian ** 2)
 
         kineticEnergy = -0.5 * (gradf2 + lap)
         
@@ -182,8 +177,8 @@ class LocalEnergyUEG(LocalEnergy):
 
 class LocalEnergyUEG2D(LocalEnergy):
 
-    def __init__(self, logWavefunction, lattice, truncationLimit=2):
-        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
+    def __init__(self, logWavefunction, lattice, sparsity_threshold, truncationLimit=2):
+        self.kineticEnergy = LocalKineticEnergy(logWavefunction, sparsity_threshold)
         self.potentialEnergy = EwaldPotential2D(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
