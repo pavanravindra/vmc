@@ -112,7 +112,7 @@ class LocalMP(wavefunctions.Wavefunction):
         
         self.slaterUp = wavefunctions.LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
         self.slaterDown = wavefunctions.LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
-        #self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
+        self.CYJastrow = wavefunctions.LogCYJastrow(self.spins, self.lattice)
 
         self.dv = 2 * self.dim + 2   # dimensionality of 2-electron features
 
@@ -133,23 +133,23 @@ class LocalMP(wavefunctions.Wavefunction):
         self.F2t1s = [nn.Dense(self.hiddenFeatures) for _ in range(self.T)]
         self.F2t2s = [nn.Dense(self.d2 - self.dv) for _ in range(self.T)]
 
+        """
         self.backflowLinear = nn.Dense(self.dim)
         """
         self.backflowLinear = nn.Dense(
             self.dim, kernel_init=nn.initializers.zeros, use_bias=False
         )
-        """
 
         self.preLinear = nn.Dense(self.d1)
         self.jastrowLinear1 = nn.Dense(self.hiddenFeatures)
         self.jastrowLinear2 = nn.Dense(self.hiddenFeatures)
         self.jastrowLinear3 = nn.Dense(self.hiddenFeatures)
+        """
         self.jastrowLinear4 = nn.Dense(1)
         """
         self.jastrowLinear4 = nn.Dense(
             1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
         )
-        """
 
     def __call__(self, rs):
 
@@ -203,28 +203,24 @@ class LocalMP(wavefunctions.Wavefunction):
         backflow = self.backflowLinear(hit)
         xs = rs + backflow
         
-        #recLattice = jnp.linalg.inv(self.lattice)
-        #xsWrap = ((xs @ recLattice) % 1) @ self.lattice
+        recLattice = jnp.linalg.inv(self.lattice)
+        xsWrap = ((xs @ recLattice) % 1) @ self.lattice
 
-        #jastrowInput = jnp.concatenate(
-        #    [hit, nn.gelu(self.preLinear(xsWrap))], axis=-1
-        #)
         jastrowInput = jnp.concatenate(
-            [hit, nn.gelu(self.preLinear(backflow))], axis=-1
+            [hit, nn.gelu(self.preLinear(xsWrap))], axis=-1
         )
         neuralJastrow = self.jastrowLinear1(jastrowInput)
         neuralJastrow += self.jastrowLinear2(nn.gelu(neuralJastrow))
         neuralJastrow += self.jastrowLinear3(nn.gelu(neuralJastrow))
         neuralJastrow = jnp.sum(self.jastrowLinear4(nn.gelu(neuralJastrow)))
         
-        #slaterUp = self.slaterUp(xsWrap[:self.spins[0],:])
-        #slaterDown = self.slaterDown(xsWrap[self.spins[0]:,:])
-        #CYJastrow = self.CYJastrow(rs)
+        slaterUp = self.slaterUp(xsWrap[:self.spins[0],:])
+        slaterDown = self.slaterDown(xsWrap[self.spins[0]:,:])
+        CYJastrow = self.CYJastrow(rs)
         slaterUp = self.slaterUp(xs[:self.spins[0],:])
         slaterDown = self.slaterDown(xs[self.spins[0]:,:])
         
-        #return slaterUp + slaterDown + CYJastrow + neuralJastrow
-        return slaterUp + slaterDown + neuralJastrow
+        return slaterUp + slaterDown + CYJastrow + neuralJastrow
 
 #upCoeffs = jnp.array(np.random.normal(size=(numKpoints, spins[0])))
 #downCoeffs = jnp.array(np.random.normal(size=(numKpoints, spins[1])))
@@ -243,14 +239,22 @@ wavefunction = CustomWavefunction(
 kpoints = wavefunctions.genKpoints(spins[0], lattice, dim)
 #wavefunction = wavefunctions.LogSimpleSlaters(spins, dim, kpoints)
 #wavefunction = wavefunctions.LogSlaterCYJastrow(spins, dim, lattice, kpoints)
-#wavefunction = wavefunctions.LogTwoBodySJB(spins, dim, lattice, kpoints, 32)
+wavefunction = wavefunctions.LogTwoBodySJB(spins, dim, lattice, kpoints, 32)
 #wavefunction = wavefunctions.LogFlatironNOMP(spins, dim, lattice, kpoints, 16, 1, 16, 16)
-wavefunction = LocalMP(spins, dim, lattice, kpoints, 32, 3, 32, 32)
+#wavefunction = LocalMP(spins, dim, lattice, kpoints, 32, 3, 32, 32)
 
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 updateWalkerPositions = jax.jit(mala.updateBatch)
 
 energies = [
+    (
+        "Old",
+        old_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice).batch
+    ),
+    (
+        "New",
+        new_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice).batch
+    ),
     (
         "folx0",
         folx_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice, 0).batch
@@ -266,14 +270,6 @@ energies = [
     (
         "folx6",
         folx_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice, 6).batch
-    ),
-    (
-        "New",
-        new_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice).batch
-    ),
-    (
-        "Old",
-        old_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice).batch
     ),
 ]
 
@@ -385,4 +381,5 @@ print("------------------------------------\n\n\n")
     
 print("{}\t{}\t{}".format("NAME   ", "ENERGY   ", "TIME   "))
 for (name, energy, time) in results:
-    print("{}\t{:.8f}\t{:.5f}".format(name, energy, time))
+    est_time = time * (1024 / walkers) * 2000 / 3600
+    print("{}\t{:.8f}\t{:.5f}".format(name, energy, est_time))
