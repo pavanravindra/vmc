@@ -87,148 +87,92 @@ class MALAUpdater:
         rngs = jax.random.split(rng, walkers)
         return self.updateWalkers(parameters, rs, rngs, tau)
 
-def wignerCrystal(spins, lattice, r_ws, walkers, rng, dim=3, gridShape=None):
+def generateBCC(spins, lattice, dim):
     """
-    Generates a Wigner Crystal initial guess for arbitrary unit cells.
+    Returns the lattice positions of the BCC-like Wigner crystal phase in 3D.
     
     Args:
         spins: Tuple (n_up, n_down)
         lattice: (dim, dim) matrix where rows are lattice vectors.
                  e.g. [[Lx, 0], [Tx, Ty]]
-        r_ws : Wigner-Seitz radius (used to determine magnitude of noise)
-        walkers: Number of walkers to generate
-        rng: JAX random key
-        dim: 2 or 3
+        dim: must be 3 for BCC-like lattice
+    """
+
+    if dim != 3:
+        raise Exception("BCC-like crystal phase is a 3D phase.")
+        
+    # BCC-LIKE LATTICE
+    
+    (NUp,NDown) = spins
+    
+    numLatticePoints = int(jnp.ceil(jnp.maximum(NUp, NDown) ** (1/3)))
+    
+    points = jnp.linspace(0, 1, numLatticePoints, endpoint=False)
+    
+    grids = jnp.meshgrid(*([points]*dim), indexing="ij")
+    frac_up = jnp.stack(grids, axis=-1).reshape(-1, dim)
+    
+    frac_shift = (1.0 / numLatticePoints) / 2.0
+    frac_down = (frac_up + frac_shift) % 1.0
+    
+    upPositions = frac_up @ lattice
+    downPositions = frac_down @ lattice
+    
+    coordinates = jnp.concatenate([
+        upPositions[:NUp], downPositions[:NDown]
+    ], axis=0)
+
+    return coordinates
+
+def generateStripedAFM(spins, lattice, dim, gridShape=None):
+    """
+    Returns the lattice positions of the striped anti-ferromagnetic (AFM)
+    Wigner crystal phase in 2D.
+    
+    Args:
+        spins: Tuple (n_up, n_down)
+        lattice: (dim, dim) matrix where rows are lattice vectors.
+                 e.g. [[Lx, 0], [Tx, Ty]]
+        dim: must be 2 for striped AFM lattice
         gridShape: specifies number of grid points along each dimension
     """
     
     NUp = spins[0]
     NDown = spins[1]
 
-    if dim == 2:
+    if dim != 2:
+        raise Exception("Striped AFM phase is a 2D phase.")
         
-        # STRIPED TRIANGULAR PHASE
+    # STRIPED TRIANGULAR PHASE
 
-        if gridShape is None:
-            n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
-            n_side_x = n_side
-            n_side_y = n_side
-        else:
-            ( n_side_x , n_side_y ) = gridShape
-            
-        x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
-        y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
-        
-        xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
-        frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
-        
-        dx = 1.0 / n_side_x
-        dy = 1.0 / n_side_y
-        
-        shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
-        
-        frac_down = (frac_up + shift_vec) % 1.0
-        
-        upPositions = frac_up @ lattice
-        downPositions = frac_down @ lattice
-        
-        singleWalker = jnp.concatenate([
-            upPositions[:NUp], downPositions[:NDown]
-        ], axis=0)
-
-    elif dim == 3:
-        
-        # BCC-LIKE LATTICE
-        
-        numLatticePoints = int(jnp.ceil(jnp.maximum(NUp, NDown) ** (1/3)))
-        
-        points = jnp.linspace(0, 1, numLatticePoints, endpoint=False)
-        
-        grids = jnp.meshgrid(*([points]*dim), indexing="ij")
-        frac_up = jnp.stack(grids, axis=-1).reshape(-1, dim)
-        
-        frac_shift = (1.0 / numLatticePoints) / 2.0
-        frac_down = (frac_up + frac_shift) % 1.0
-        
-        upPositions = frac_up @ lattice
-        downPositions = frac_down @ lattice
-        
-        singleWalker = jnp.concatenate([
-            upPositions[:NUp], downPositions[:NDown]
-        ], axis=0)
-
+    if gridShape is None:
+        n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
+        n_side_x = n_side
+        n_side_y = n_side
     else:
-        raise Exception("Only dim=2 or dim=3 are supported.")
-
-    allWalkers = jnp.broadcast_to(
-        singleWalker, (walkers,) + singleWalker.shape
-    )
-    noise = jax.random.normal(rng, allWalkers.shape) * r_ws * 0.01
+        ( n_side_x , n_side_y ) = gridShape
+        
+    x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
+    y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
     
-    return allWalkers + noise
-
-def wignerCrystalFloating(spins, lattice, r_ws, walkers, rng, dim=3, gridShape=None):
-    """
-    EXPERIMENTAL: Generates a set of **floating** Wigner Crystal configurations
-    to mimic the Flatiron setup. The "floating" aspect partially restores
-    translational invariance (along only the x-direction).
+    xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
+    frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
     
-    Args:
-        spins: Tuple (n_up, n_down)
-        lattice: (dim, dim) matrix where rows are lattice vectors.
-                 e.g. [[Lx, 0], [Tx, Ty]]
-        r_ws : Wigner-Seitz radius (used to determine magnitude of noise)
-        walkers: Number of walkers to generate
-        rng: JAX random key
-        dim: 2 or 3
-        gridShape: specifies number of grid points along each dimension
-    """
+    dx = 1.0 / n_side_x
+    dy = 1.0 / n_side_y
     
-    NUp = spins[0]
-    NDown = spins[1]
-
-    if dim == 2 and gridShape == (7,4):
-        
-        # FLOATING STRIPED TRIANGULAR PHASE
-
-        if gridShape is None:
-            n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
-            n_side_x = n_side
-            n_side_y = n_side
-        else:
-            ( n_side_x , n_side_y ) = gridShape
-            
-        x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
-        y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
-        
-        xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
-        frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
-        
-        dx = 1.0 / n_side_x
-        dy = 1.0 / n_side_y
-        
-        shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
-        
-        frac_down = (frac_up + shift_vec) % 1.0
-        
-        upPositions = frac_up @ lattice
-        downPositions = frac_down @ lattice
-        
-        singleWalker = jnp.concatenate([
-            upPositions[:NUp], downPositions[:NDown]
-        ], axis=0)
-
-    else:
-        raise Exception("Only Flatiron setup is supported.")
-
-    rng_noise, rng_shift = jax.random.split(rng, 2)
-    allWalkers = jnp.broadcast_to(
-        singleWalker, (walkers,) + singleWalker.shape
-    )
-    noise = jax.random.normal(rng_noise, allWalkers.shape) * r_ws * 0.01
-    shift = (lattice[0,:] / 7) * jax.random.uniform(rng_shift, shape=(walkers,))[:,None,None]
+    shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
     
-    return allWalkers + noise + shift
+    frac_down = (frac_up + shift_vec) % 1.0
+    
+    upPositions = frac_up @ lattice
+    downPositions = frac_down @ lattice
+    
+    coordinates = jnp.concatenate([
+        upPositions[:NUp], downPositions[:NDown]
+    ], axis=0)
+
+    return coordinates
 
 def acceptanceArray(rs1, rs2):
     """
