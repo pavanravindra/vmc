@@ -1,4 +1,0 @@
-r_ws	Best Energy		Median Energy		Converges
-20	-4.62474204e-02		-4.59689725e-02		15 / 16
-
-15 / 16 runs converged
