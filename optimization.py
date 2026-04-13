@@ -141,18 +141,18 @@ class StochasticReconfiguration:
         )
 
     def __call__(self, parameters, walkerRs, learningRate, diagonalShift):
-        
-        localEnergies = self.localEnergy.batch(parameters, walkerRs)
-        parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
+
+        localEnergies = self.localEnergy.batch(parameters, walkerRs)          # (W,)
+        parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)    # (W,P)
         (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
         numWalkers = parameterGrads.shape[0]
 
-        exp_H = jnp.average(localEnergies)
-        exp_O = jnp.average(parameterGrads, axis=0)
-        exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
+        exp_H = jnp.average(localEnergies)                                    # ()
+        exp_O = jnp.average(parameterGrads, axis=0)                           # (P,)
+        exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)  # (P,)
 
-        f_k = 2 * (exp_O * exp_H - exp_OH)
-        U = parameterGrads - exp_O[None,:]
+        f_k = 2 * (exp_O * exp_H - exp_OH)                                    # (P,)  
+        U = parameterGrads - exp_O[None,:]                                    # (W,P)
 
         if self.mode == 'normal':
             s_jk = U.T @ U / numWalkers
@@ -185,10 +185,6 @@ class StochasticReconfiguration:
 class StochasticReconfigurationMomentum:
     """
     Updates parameters using stochastic reconfiguration with momentum.
-
-    TODO: This is deprecated since it doesn't allow for learning rates to vary
-    for different types of parameters (i.e., I still need to allow for the
-    learning rate to be a pytree).
     """
 
     def __init__(self, logWavefunction, localEnergy, mode='normal'):
@@ -201,18 +197,18 @@ class StochasticReconfigurationMomentum:
 
     def __call__(self, parameters, walkerRs, learningRate, diagonalShift, mu, history):
 
-        localEnergies = self.localEnergy.batch(parameters, walkerRs)
-        parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)
+        localEnergies = self.localEnergy.batch(parameters, walkerRs)          # (W,)
+        parameterGrads = self.parameterGradBatchFlat(parameters, walkerRs)    # (W,P)
         (flatParameters,unravel) = jax.flatten_util.ravel_pytree(parameters)
         numWalkers = parameterGrads.shape[0]
 
-        exp_H = jnp.average(localEnergies)
-        exp_O = jnp.average(parameterGrads, axis=0)
-        exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)
+        exp_H = jnp.average(localEnergies)                                    # ()
+        exp_O = jnp.average(parameterGrads, axis=0)                           # (P,)
+        exp_OH = jnp.average(localEnergies[:,None] * parameterGrads, axis=0)  # (P,)
 
-        g_k = 2 * (exp_O * exp_H - exp_OH)
-        f_k = g_k + diagonalShift * mu * history
-        U = parameterGrads - exp_O[None,:]
+        g_k = 2 * (exp_O * exp_H - exp_OH)                                    # (P,)
+        f_k = g_k + diagonalShift * mu * history                              # (P,)
+        U = parameterGrads - exp_O[None,:]                                    # (W,P)
 
         if self.mode == 'normal':
             s_jk = U.T @ U / numWalkers

@@ -164,10 +164,10 @@ class EwaldPotential2D(LocalEnergy):
         vals = vals.at[jnp.diag_indices(N)].set(0.0)
         return 0.5 * jnp.sum(vals) + 0.5 * N * self.madelung_const
 
-class LocalEnergyUEG(LocalEnergy):
+class LocalEnergyUEG3D(LocalEnergy):
 
-    def __init__(self, logWavefunction, lattice, truncationLimit=2):
-        self.kineticEnergy = LocalKineticEnergy(logWavefunction)
+    def __init__(self, logWavefunction, lattice, sparsity_threshold, truncationLimit=2):
+        self.kineticEnergy = LocalKineticEnergy(logWavefunction, sparsity_threshold)
         self.potentialEnergy = EwaldPotential(lattice, truncationLimit)
 
     def configuration(self, parameters, rs):
