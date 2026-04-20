@@ -244,8 +244,11 @@ class LogMPSlater(Wavefunction):
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
 
-        self.mp_coeffs = self.param(
-            "MP_coefficients", lambda _ : self.init_coeffs
+        self.real_mp_coeffs = self.param(
+            "real_MP_coefficients", lambda _ : jnp.real(self.init_coeffs)
+        )
+        self.imag_mp_coeffs = self.param(
+            "imag_MP_coefficients", lambda _ : jnp.imag(self.init_coeffs)
         )
 
     def __call__(self, rs):
@@ -253,31 +256,26 @@ class LogMPSlater(Wavefunction):
             def localKpointFunction(k):
                 return jnp.exp(1j * jnp.dot(k, ri))
             return jax.vmap(localKpointFunction)(self.kpoints)
+        mp_coeffs = self.real_mp_coeffs + 1j * self.imag_mp_coeffs
         basisMatrix = jax.vmap(makeBasisRow)(rs)               # ( N , Nk )
-        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)   # ( N , N )
+        orbitalMatrix = jnp.dot(basisMatrix, mp_coeffs)        # ( N , N )
         phase, logmag = jnp.linalg.slogdet(orbitalMatrix)
         angle = jnp.angle(phase)
         return angle, logmag
 
 def generateGaussianMPCoeffs(kpoints, centers, alpha):
     """
-    TODO : This needs to be updated to handle complex wavefunctions.
 
-    Generate fixed MP coefficients corresponding to a truncated Fourier
-    representation of periodized Gaussian-like orbitals centered at `centers`,
-    in the real cosine/sine basis convention
+    Generate fixed complex Fourier coefficients corresponding to a truncated
+    Fourier representation of periodized Gaussian-like orbitals centered at
+    `centers`, in the complex exponential basis
 
-        [0, k1, -k1, k2, -k2, ...]
-
-    where:
-      - index 0 is the constant / cos(0) term
-      - odd indices use cos(k · r)
-      - even indices use sin(k · r)
+        exp(i k · r)
 
     Parameters
     ----------
     kpoints : jnp.ndarray, shape (Nk, dim)
-        Reciprocal vectors in the ordering [0, k1, -k1, k2, -k2, ...].
+        Reciprocal lattice vectors.
     centers : jnp.ndarray, shape (N, dim)
         Orbital centers R_j.
     alpha : float or scalar jnp.ndarray
@@ -286,29 +284,19 @@ def generateGaussianMPCoeffs(kpoints, centers, alpha):
     Returns
     -------
     coeffs : jnp.ndarray, shape (Nk, N)
-        Coefficients for use in, e.g., LogFixedMPSlater.
+        Complex Fourier coefficients. Column j contains the coefficients for
+        the Gaussian centered at centers[j].
     """
-    Nk = kpoints.shape[0]
+    dots = jnp.dot(kpoints, centers.T)                  # (Nk, N)
+    ksq = jnp.sum(kpoints**2, axis=1)                   # (Nk,)
+    weights = jnp.exp(-ksq / (4.0 * alpha))[:, None]    # (Nk, 1)
 
-    cos_switch = jnp.zeros(Nk, dtype=kpoints.dtype).at[0].set(1.0)
-    cos_switch = cos_switch.at[jnp.arange(1, Nk, 2)].set(1.0)
-    sin_switch = 1.0 - cos_switch
-
-    dots = jnp.dot(kpoints, centers.T)                 # (Nk, N)
-    ksq = jnp.sum(kpoints**2, axis=1)                  # (Nk,)
-    weights = jnp.exp(-ksq / (4.0 * alpha))[:, None]  # (Nk, 1)
-
-    coeffs = weights * (
-        cos_switch[:, None] * jnp.cos(dots) +
-        sin_switch[:, None] * jnp.sin(dots)
-    )
+    coeffs = weights * jnp.exp(-1j * dots)              # (Nk, N)
 
     return coeffs
 
 class LogGaussianSlater(Wavefunction):
     """
-    TODO : This needs to be updated to handle complex wavefunctions.
-
     Log-wavefunction for a Slater determinant whose orbitals are initialized as
     truncated Fourier representations of periodized Gaussian orbitals centered
     at the provided positions.
@@ -327,12 +315,6 @@ class LogGaussianSlater(Wavefunction):
         if self.dim not in (2, 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
 
-        Nk = self.kpoints.shape[0]
-        cos = jnp.zeros(Nk, dtype=self.kpoints.dtype).at[0].set(1.0)
-        cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
-        self.cos_switch = cos
-        self.sin_switch = 1.0 - cos
-
         self.log_alpha = self.param(
             "log_alpha",
             lambda _: jnp.array(
@@ -344,13 +326,9 @@ class LogGaussianSlater(Wavefunction):
     def __call__(self, rs):
 
         def makeBasisRow(ri):
-            def localKpointFunction(k, c_switch, s_switch):
-                dot_val = jnp.dot(k, ri)
-                return c_switch * jnp.cos(dot_val) + s_switch * jnp.sin(dot_val)
-
-            return jax.vmap(localKpointFunction)(
-                self.kpoints, self.cos_switch, self.sin_switch
-            )
+            def localKpointFunction(k):
+                return jnp.exp(1j * jnp.dot(k, ri))
+            return jax.vmap(localKpointFunction)(self.kpoints)
 
         basisMatrix = jax.vmap(makeBasisRow)(rs)      # (N, Nk)
         alpha = jnp.exp(self.log_alpha)
@@ -358,8 +336,9 @@ class LogGaussianSlater(Wavefunction):
             self.kpoints, self.centers, alpha
         )                                             # (Nk, N)
         orbitalMatrix = jnp.dot(basisMatrix, coeffs)  # (N, N)
-
-        return jnp.linalg.slogdet(orbitalMatrix)[1]
+        phase, logmag = jnp.linalg.slogdet(orbitalMatrix)
+        angle = jnp.angle(phase)
+        return angle, logmag
 
 def coulombYukawa(r_real, r_frac, A, F):
     """

@@ -104,6 +104,9 @@ class EnergyMinimization:
 
 def smw_solve(P, f, lam):
     """
+    TODO: update this docstring to better reflect how this works for
+    complex-valued wavefunctions.
+    
     Given a system of equations:
 
         S theta = f     where
@@ -153,7 +156,7 @@ class StochasticReconfigurationMomentum:
             localEnergies[:,None] * parameterGrads.conj(), axis=0
         )                                                                     # (P,)
 
-        g_k = jnp.real(2 * (exp_O.conj() * exp_H - exp_OstarH))               # (P,)
+        g_k = 2 * jnp.real((exp_O.conj() * exp_H - exp_OstarH))               # (P,)
         f_k = g_k + diagonalShift * mu * history                              # (P,)
         U = parameterGrads - exp_O[None,:]                                    # (W,P)
 
@@ -164,9 +167,10 @@ class StochasticReconfigurationMomentum:
 
         elif self.mode == 'smw':
 
-            raise Exception("Specified SR mode not supported.")
-        
-            P = U / jnp.sqrt(numWalkers)
+            P = jnp.concatenate(
+                [jnp.real(U), jnp.imag(U)],
+                axis=0
+            ) / jnp.sqrt(numWalkers)
             parameterStep = smw_solve(P, f_k, diagonalShift)
 
         else:
