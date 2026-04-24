@@ -282,6 +282,89 @@ class LogMPSlater(Wavefunction):
         orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)   # ( N , N )
         return jnp.linalg.slogdet(orbitalMatrix)[1]
 
+def occ_columns_from_theta(theta: jnp.ndarray) -> jnp.ndarray:
+    """
+    Complex exponential parametrization of a Slater determinant.
+
+    `theta` : shape (M-N,N) -> represents rotation into "excited" states
+    `C`     : shape (M,N) -> contains linear combination coefficients in basis
+    """
+    thetaT = jnp.asarray(theta).T
+    n_occ = thetaT.shape[0]
+    U, s, Vh = jnp.linalg.svd(thetaT, full_matrices=False)
+    V = jnp.conj(Vh.T)
+    c = jnp.cos(s)
+    sn = jnp.sin(s)
+    I_occ = jnp.eye(n_occ, dtype=theta.dtype)
+    U_oo = I_occ + U @ jnp.diag(c - 1.0) @ jnp.conj(U.T)
+    U_vo = V @ jnp.diag(sn) @ jnp.conj(U.T)
+    C = jnp.vstack([U_oo, U_vo])
+    return C
+
+
+def theta_from_occ_columns(C: jnp.ndarray) -> jnp.ndarray:
+    """
+    Recover a complex Thouless matrix theta from a Slater determinant.
+
+    `C`     : shape (M,N) -> contains linear combination coefficients in basis
+    `theta` : shape (M-N,N) -> represents rotation into "excited" states
+    """
+    C = jnp.asarray(C)
+    n_occ = C.shape[1]
+    C_occ = C[:n_occ, :]
+    C_vir = C[n_occ:, :]
+    X = C_vir @ jnp.linalg.inv(C_occ)
+    Ux, t, Vxh = jnp.linalg.svd(X, full_matrices=False)
+    Vx = jnp.conj(Vxh.T)
+    s = jnp.arctan(t)
+    theta = (Vx @ jnp.diag(s) @ jnp.conj(Ux.T)).T
+    return theta
+
+class LogThoulessSlater(Wavefunction):
+    """
+    Creates a log-wavefunction that is a Slater determinant built from a
+    multiple planewave basis, represented using a Thouless rotation.
+
+    IMPORTANT: This code assumes that the k-points come in order like
+                [0, k1, -k1, k2, -k2, ...]
+    """
+    N : int
+    dim : int
+    kpoints : jnp.ndarray       # ( Nk , dim )
+    init_coeffs : jnp.ndarray   # ( Nk , N )
+
+    def setup(self):
+        
+        if not (self.dim == 2 or self.dim == 3):
+            raise Exception("Only dim=2 or dim=3 are supported.")
+            
+        Nk = self.kpoints.shape[0]
+        cos = jnp.zeros(Nk).at[0].set(1.0)
+        cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
+        self.cos_switch = cos
+        self.sin_switch = 1.0 - cos
+
+        thouless = theta_from_occ_columns(self.init_coeffs)
+        self.thouless = self.param(
+            "thouless_rotation", lambda _ : thouless
+        )
+
+    def __call__(self, rs):
+        def makeBasisRow(ri):
+            def localKpointFunction(k, c_switch, s_switch):
+                dot_val = jnp.dot(k, ri)
+                term = (c_switch * jnp.cos(dot_val) + 
+                        s_switch * jnp.sin(dot_val))
+                return term
+            terms = jax.vmap(localKpointFunction)(
+                self.kpoints, self.cos_switch, self.sin_switch
+            )
+            return terms
+        basisMatrix = jax.vmap(makeBasisRow)(rs)          # ( N , Nk )
+        mp_coeffs = occ_columns_from_theta(self.thouless) # ( Nk , N )
+        orbitalMatrix = jnp.dot(basisMatrix, mp_coeffs)   # ( N , N )
+        return jnp.linalg.slogdet(orbitalMatrix)[1]
+
 class LogFixedMPSlater(Wavefunction):
     """
     Creates a log-wavefunction that is a Slater determinant built from a
