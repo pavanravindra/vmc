@@ -11,7 +11,8 @@ from flax import linen as nn
 from flax.core.frozen_dict import freeze, unfreeze
 import numpy as np
 
-import wavefunctions, folx_hamiltonian, trajectory, optimization
+import folx_hamiltonian, trajectory, optimization
+import exp_wavefunctions as wavefunctions
 
 #jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", True)
@@ -114,7 +115,7 @@ centers = trajectory.generateStripedAFM(spins, lattice, dim, gridShape=(7,4))
 rs = centers[None,:,:] + (r_ws / 10) * jax.random.normal(rs_rng, shape=(walkers,N,dim))
 
 coeffShape = (numKpoints, spins[0])
-thouless_noise = 1e-6
+thouless_noise = 5e-3
 upCoeffs = jnp.eye(numKpoints, spins[0]) + thouless_noise * np.random.normal(size=coeffShape)
 downCoeffs = jnp.eye(numKpoints, spins[1]) + thouless_noise * np.random.normal(size=coeffShape)
 
