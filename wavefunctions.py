@@ -12,7 +12,10 @@ import numpy as np
 
 import itertools
 
-def computeLattice(N, r_ws, dim, basis_matrix=None):
+
+def compute_lattice(
+    N: int, r_ws: float, dim: int, basis_matrix=None
+) -> jnp.ndarray:
     """
     Computes the scaled lattice matrix for a given number of particles and
     Wigner-Seitz radius.
@@ -21,9 +24,9 @@ def computeLattice(N, r_ws, dim, basis_matrix=None):
         N: Number of particles.
         r_ws: Wigner-Seitz radius (r_s).
         dim: 2 or 3.
-        basis_matrix: (dim, dim) Optional template lattice. 
+        basis_matrix: (dim, dim) Optional template lattice.
                       If None, defaults to the identity (cubic/square).
-                      The output will be this matrix scaled to match the 
+                      The output will be this matrix scaled to match the
                       target density.
     """
     if dim == 2:
@@ -45,9 +48,9 @@ def computeLattice(N, r_ws, dim, basis_matrix=None):
     return basis_matrix * scale
 
 
-def computeRws(N, lattice, dim):
+def compute_r_ws(N: int, lattice: jnp.ndarray, dim: int) -> jnp.ndarray:
     """
-    Computes the effective Wigner-Seitz radius for a given lattice and 
+    Computes the effective Wigner-Seitz radius for a given lattice and
     particle count.
 
     Args:
@@ -56,7 +59,7 @@ def computeRws(N, lattice, dim):
         dim: 2 or 3.
     """
     vol = jnp.abs(jnp.linalg.det(lattice))
-    
+
     if dim == 2:
         return jnp.sqrt(vol / (jnp.pi * N))
     elif dim == 3:
@@ -64,35 +67,31 @@ def computeRws(N, lattice, dim):
     else:
         raise ValueError("Only dim=2 or dim=3 are supported.")
 
-def saveParameters(filename, parameters):
-    """
-    Saves a pytree object that contains a wavefunction's parameters.
-    """
+
+def save_parameters(filename: str, parameters) -> bool:
+    """Saves a pytree object that contains a wavefunction's parameters."""
     with open(filename, "wb") as f:
         f.write(to_bytes(parameters))
     return True
 
-def loadParameters(filename):
-    """
-    Loads a pytree FrozenDict from provided file. The file should have been
-    saved using the `saveParameters` method above.
-    """
+
+def load_parameters(filename: str):
+    """Loads a pytree FrozenDict from a file written by save_parameters."""
     with open(filename, "rb") as f:
         parameters = from_bytes(FrozenDict, f.read())
     return parameters
 
+
 class Wavefunction(nn.Module):
-    """
-    Defines batched functions based on single-walker functions. This way you
-    only need to define single-walker initialize and forward pass functions
-    when defining wavefunctions.
-    """
-    def initBatch(self, rng, walkerRs):
-        return self.init(rng, walkerRs[0,:,:])
-    
-    def applyBatch(self, parameters, walkerRs):
-        vmapApply = jax.vmap(self.apply, in_axes=(None,0))
+    """Base class; exposes batched init and forward pass over a walker array."""
+
+    def init_batch(self, rng, walkerRs: jnp.ndarray):
+        return self.init(rng, walkerRs[0, :, :])
+
+    def apply_batch(self, parameters, walkerRs: jnp.ndarray) -> jnp.ndarray:
+        vmapApply = jax.vmap(self.apply, in_axes=(None, 0))
         return vmapApply(parameters, walkerRs)
+
 
 def _canonical_pos_int(k_int: np.ndarray) -> bool:
     """
@@ -107,7 +106,10 @@ def _canonical_pos_int(k_int: np.ndarray) -> bool:
             return False
     return True  # k=0 treated as positive
 
-def genKpoints(N: int, lattice, dim: int, safety: float = 2.5, extra: int = 4):
+
+def gen_k_points(
+    N: int, lattice: jnp.ndarray, dim: int, safety: float = 2.5, extra: int = 4
+) -> jnp.ndarray:
     """
     Deterministic k-point generator with stable ordering and adjacent ± pairs.
 
@@ -136,34 +138,28 @@ def genKpoints(N: int, lattice, dim: int, safety: float = 2.5, extra: int = 4):
     lattice = np.array(lattice, dtype=np.float64)
     rec_lattice = 2 * np.pi * np.linalg.inv(lattice).T  # (dim, dim)
 
-    # --- Choose a conservative integer search box ---
-    # Estimate k-radius for N points in k-space volume, then map to integer bounds.
     vol_k_cell = abs(np.linalg.det(rec_lattice))
     if dim == 2:
         k_radius = np.sqrt(N * vol_k_cell / np.pi)
     else:
         k_radius = (N * vol_k_cell * 3.0 / (4.0 * np.pi)) ** (1.0 / 3.0)
 
-    rec_norms = np.linalg.norm(rec_lattice, axis=1)  # norms of reciprocal basis vectors
-    max_integers = np.ceil((safety * k_radius) / rec_norms).astype(int) + extra  # (dim,)
+    rec_norms = np.linalg.norm(rec_lattice, axis=1)
+    max_integers = np.ceil((safety * k_radius) / rec_norms).astype(int) + extra
 
     ranges = [range(-m, m + 1) for m in max_integers]
-    int_candidates = np.array(list(itertools.product(*ranges)), dtype=int)  # (M, dim)
+    int_candidates = np.array(list(itertools.product(*ranges)), dtype=int)
 
-    # Physical k and squared norms
-    phys_k = int_candidates @ rec_lattice  # (M, dim)
-    k2 = np.einsum("ij,ij->i", phys_k, phys_k)  # (M,)
+    phys_k = int_candidates @ rec_lattice
+    k2 = np.einsum("ij,ij->i", phys_k, phys_k)
 
-    # Deterministic sort: primary key k2, then integer components lexicographically
-    # np.lexsort uses last key as primary, so we pass reversed order.
-    keys = [int_candidates[:, d] for d in range(dim-1, -1, -1)] + [k2]
+    keys = [int_candidates[:, d] for d in range(dim - 1, -1, -1)] + [k2]
     order = np.lexsort(keys)
     candidates_sorted = int_candidates[order]
 
     selected = []
     seen = set()
 
-    # Ensure k=0 is first if present
     zero = tuple([0] * dim)
     if zero in map(tuple, candidates_sorted):
         selected.append(np.array(zero, dtype=int))
@@ -179,15 +175,12 @@ def genKpoints(N: int, lattice, dim: int, safety: float = 2.5, extra: int = 4):
         if kt == zero:
             continue
 
-        # Only consider canonical representative for each ± pair
         if not _canonical_pos_int(k_int):
             continue
 
-        # Add k
         selected.append(k_int.copy())
         seen.add(kt)
 
-        # Add -k if room
         if len(selected) < N:
             nk = tuple((-k_int).tolist())
             selected.append((-k_int).copy())
@@ -197,66 +190,61 @@ def genKpoints(N: int, lattice, dim: int, safety: float = 2.5, extra: int = 4):
     chosen = selected @ rec_lattice
     return jnp.array(chosen)
 
+
 class LogSimpleSlater(Wavefunction):
     """
-    Creates a log-wavefunction that is just a simple Slater determinant of the
-    input electron coordinates. The basis for the determinant is specified by
-    the provided kpoints.
+    Slater determinant of the N lowest-energy planewaves (fixed, no trainable params).
 
-    IMPORTANT: This code assumes that the k-points come in order like
-                [0, k1, -k1, k2, -k2, ...]
-    
-    NOTE: These determinants use the convention that different particle
-    positions are in different rows. Columns correspond to plane wave orbitals.
+    IMPORTANT: Assumes k-points ordered as [0, k1, -k1, k2, -k2, ...].
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray
+    N: int
+    dim: int
+    kpoints: jnp.ndarray
 
     def setup(self):
-        
+
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
-            
+
         Nk = self.kpoints.shape[0]
         cos = jnp.zeros(Nk).at[0].set(1.0)
         cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
         self.cos_switch = cos
         self.sin_switch = 1.0 - cos
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
         def makeSimpleSlaterRow(ri):
             def localKpointFunction(k, c_switch, s_switch):
                 dot_val = jnp.dot(k, ri)
-                term = (c_switch * jnp.cos(dot_val) + 
+                term = (c_switch * jnp.cos(dot_val) +
                         s_switch * jnp.sin(dot_val))
                 return term
             return jax.vmap(localKpointFunction)(
-                self.kpoints, 
-                self.cos_switch, 
+                self.kpoints,
+                self.cos_switch,
                 self.sin_switch
             )
         slaterMatrix = jax.vmap(makeSimpleSlaterRow)(rs)
         return jnp.linalg.slogdet(slaterMatrix)[1]
 
+
 class LogMPSlater(Wavefunction):
     """
-    Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis.
+    Slater determinant from a trainable multiple-planewave orbital expansion.
+    Each orbital is a linear combination of planewaves: φ_a(x) = Σ_k c_{ak} φ_k(x).
 
-    IMPORTANT: This code assumes that the k-points come in order like
-                [0, k1, -k1, k2, -k2, ...]
+    IMPORTANT: Assumes k-points ordered as [0, k1, -k1, k2, -k2, ...].
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray       # ( Nk , dim )
-    init_coeffs : jnp.ndarray   # ( Nk , N )
+    N: int
+    dim: int
+    kpoints: jnp.ndarray      # (Nk, dim)
+    init_coeffs: jnp.ndarray  # (Nk, N)
 
     def setup(self):
-        
+
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
-            
+
         Nk = self.kpoints.shape[0]
         cos = jnp.zeros(Nk).at[0].set(1.0)
         cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
@@ -267,47 +255,57 @@ class LogMPSlater(Wavefunction):
             "MP_coefficients", lambda rng: self.init_coeffs
         )
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
         def makeBasisRow(ri):
             def localKpointFunction(k, c_switch, s_switch):
                 dot_val = jnp.dot(k, ri)
-                term = (c_switch * jnp.cos(dot_val) + 
+                term = (c_switch * jnp.cos(dot_val) +
                         s_switch * jnp.sin(dot_val))
                 return term
             terms = jax.vmap(localKpointFunction)(
                 self.kpoints, self.cos_switch, self.sin_switch
             )
             return terms
-        basisMatrix = jax.vmap(makeBasisRow)(rs)               # ( N , Nk )
-        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs)   # ( N , N )
+        basisMatrix = jax.vmap(makeBasisRow)(rs)             # (N, Nk)
+        orbitalMatrix = jnp.dot(basisMatrix, self.mp_coeffs) # (N, N)
         return jnp.linalg.slogdet(orbitalMatrix)[1]
+
 
 def occ_columns_from_theta(theta: jnp.ndarray) -> jnp.ndarray:
     """
-    Complex exponential parametrization of a Slater determinant.
+    Smooth Grassmannian map from Thouless parameters to orbital coefficient matrix.
 
-    `theta` : shape (M-N,N) -> represents rotation into "excited" states
-    `C`     : shape (M,N) -> contains linear combination coefficients in basis
+    Args:
+        theta: (N_virt, N_occ) virtual-to-occupied mixing angles.
+
+    Returns:
+        C: (N_total, N_occ) orbital coefficient matrix.
+           At theta=0 returns the Fermi sea (first N_occ columns of identity).
+
+    Uses the matrix exponential of the block anti-symmetric generator
+        K = [[0, -θᵀ], [θ, 0]]
+    so that the gradient is finite everywhere, including at theta=0 (the Fermi
+    Liquid optimum) where the SVD-based alternative is ill-conditioned.
     """
-    thetaT = jnp.asarray(theta).T
-    n_occ = thetaT.shape[0]
-    U, s, Vh = jnp.linalg.svd(thetaT, full_matrices=False)
-    V = jnp.conj(Vh.T)
-    c = jnp.cos(s)
-    sn = jnp.sin(s)
-    I_occ = jnp.eye(n_occ, dtype=theta.dtype)
-    U_oo = I_occ + U @ jnp.diag(c - 1.0) @ jnp.conj(U.T)
-    U_vo = V @ jnp.diag(sn) @ jnp.conj(U.T)
-    C = jnp.vstack([U_oo, U_vo])
-    return C
+    n_virt, n_occ = theta.shape
+    n_total = n_occ + n_virt
+    K = jnp.zeros((n_total, n_total), dtype=theta.dtype)
+    K = K.at[n_occ:, :n_occ].set(theta)      # virt-occ block
+    K = K.at[:n_occ, n_occ:].set(-theta.T)   # occ-virt block (anti-symmetric)
+    return jax.scipy.linalg.expm(K)[:, :n_occ]
 
 
 def theta_from_occ_columns(C: jnp.ndarray) -> jnp.ndarray:
     """
-    Recover a complex Thouless matrix theta from a Slater determinant.
+    Recover a Thouless parameter matrix theta from an orbital coefficient matrix.
 
-    `C`     : shape (M,N) -> contains linear combination coefficients in basis
-    `theta` : shape (M-N,N) -> represents rotation into "excited" states
+    Args:
+        C: (N_total, N_occ) orbital coefficient matrix.
+
+    Returns:
+        theta: (N_virt, N_occ) Thouless parameters.
+
+    Used only for initialization (runs outside JIT).
     """
     C = jnp.asarray(C)
     n_occ = C.shape[1]
@@ -320,24 +318,27 @@ def theta_from_occ_columns(C: jnp.ndarray) -> jnp.ndarray:
     theta = (Vx @ jnp.diag(s) @ jnp.conj(Ux.T)).T
     return theta
 
+
 class LogThoulessSlater(Wavefunction):
     """
-    Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis, represented using a Thouless rotation.
+    Slater determinant parameterized via Thouless rotation of the Fermi sea.
 
-    IMPORTANT: This code assumes that the k-points come in order like
-                [0, k1, -k1, k2, -k2, ...]
+    The trainable parameter `thouless_rotation` has shape (N_virt, N_occ) and
+    maps to orbital coefficients via occ_columns_from_theta (matrix-exponential
+    based, well-conditioned at theta=0).
+
+    IMPORTANT: Assumes k-points ordered as [0, k1, -k1, k2, -k2, ...].
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray       # ( Nk , dim )
-    init_coeffs : jnp.ndarray   # ( Nk , N )
+    N: int
+    dim: int
+    kpoints: jnp.ndarray      # (Nk, dim)
+    init_coeffs: jnp.ndarray  # (Nk, N)
 
     def setup(self):
-        
+
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
-            
+
         Nk = self.kpoints.shape[0]
         cos = jnp.zeros(Nk).at[0].set(1.0)
         cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
@@ -346,66 +347,67 @@ class LogThoulessSlater(Wavefunction):
 
         thouless = theta_from_occ_columns(self.init_coeffs)
         self.thouless = self.param(
-            "thouless_rotation", lambda _ : thouless
+            "thouless_rotation", lambda _: thouless
         )
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
         def makeBasisRow(ri):
             def localKpointFunction(k, c_switch, s_switch):
                 dot_val = jnp.dot(k, ri)
-                term = (c_switch * jnp.cos(dot_val) + 
+                term = (c_switch * jnp.cos(dot_val) +
                         s_switch * jnp.sin(dot_val))
                 return term
             terms = jax.vmap(localKpointFunction)(
                 self.kpoints, self.cos_switch, self.sin_switch
             )
             return terms
-        basisMatrix = jax.vmap(makeBasisRow)(rs)          # ( N , Nk )
-        mp_coeffs = occ_columns_from_theta(self.thouless) # ( Nk , N )
-        orbitalMatrix = jnp.dot(basisMatrix, mp_coeffs)   # ( N , N )
+        basisMatrix = jax.vmap(makeBasisRow)(rs)           # (N, Nk)
+        mp_coeffs = occ_columns_from_theta(self.thouless)  # (Nk, N)
+        orbitalMatrix = jnp.dot(basisMatrix, mp_coeffs)    # (N, N)
         return jnp.linalg.slogdet(orbitalMatrix)[1]
+
 
 class LogFixedMPSlater(Wavefunction):
     """
-    Creates a log-wavefunction that is a Slater determinant built from a
-    multiple planewave basis. The MP coefficients in this implementation are
-    fixed at initialization.
+    Slater determinant from a fixed (non-trainable) multiple-planewave expansion.
 
-    IMPORTANT: This code assumes that the k-points come in order like
-                [0, k1, -k1, k2, -k2, ...]
+    IMPORTANT: Assumes k-points ordered as [0, k1, -k1, k2, -k2, ...].
     """
-    N : int
-    dim : int
-    kpoints : jnp.ndarray       # ( Nk , dim )
-    coeffs : jnp.ndarray        # ( Nk , N )
+    N: int
+    dim: int
+    kpoints: jnp.ndarray  # (Nk, dim)
+    coeffs: jnp.ndarray   # (Nk, N)
 
     def setup(self):
-        
+
         if not (self.dim == 2 or self.dim == 3):
             raise Exception("Only dim=2 or dim=3 are supported.")
-            
+
         Nk = self.kpoints.shape[0]
         cos = jnp.zeros(Nk).at[0].set(1.0)
         cos = cos.at[jnp.arange(1, Nk, 2)].set(1.0)
         self.cos_switch = cos
         self.sin_switch = 1.0 - cos
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
         def makeBasisRow(ri):
             def localKpointFunction(k, c_switch, s_switch):
                 dot_val = jnp.dot(k, ri)
-                term = (c_switch * jnp.cos(dot_val) + 
+                term = (c_switch * jnp.cos(dot_val) +
                         s_switch * jnp.sin(dot_val))
                 return term
             terms = jax.vmap(localKpointFunction)(
                 self.kpoints, self.cos_switch, self.sin_switch
             )
             return terms
-        basisMatrix = jax.vmap(makeBasisRow)(rs)               # ( N , Nk )
-        orbitalMatrix = jnp.dot(basisMatrix, self.coeffs)      # ( N , N )
+        basisMatrix = jax.vmap(makeBasisRow)(rs)           # (N, Nk)
+        orbitalMatrix = jnp.dot(basisMatrix, self.coeffs)  # (N, N)
         return jnp.linalg.slogdet(orbitalMatrix)[1]
 
-def generateGaussianMPCoeffs(kpoints, centers, alpha):
+
+def generate_gaussian_mp_coeffs(
+    kpoints: jnp.ndarray, centers: jnp.ndarray, alpha: float
+) -> jnp.ndarray:
     """
     Generate fixed MP coefficients corresponding to a truncated Fourier
     representation of periodized Gaussian-like orbitals centered at `centers`,
@@ -440,7 +442,7 @@ def generateGaussianMPCoeffs(kpoints, centers, alpha):
 
     dots = jnp.dot(kpoints, centers.T)                 # (Nk, N)
     ksq = jnp.sum(kpoints**2, axis=1)                  # (Nk,)
-    weights = jnp.exp(-ksq / (4.0 * alpha))[:, None]  # (Nk, 1)
+    weights = jnp.exp(-ksq / (4.0 * alpha))[:, None]   # (Nk, 1)
 
     coeffs = weights * (
         cos_switch[:, None] * jnp.cos(dots) +
@@ -449,20 +451,18 @@ def generateGaussianMPCoeffs(kpoints, centers, alpha):
 
     return coeffs
 
+
 class LogGaussianSlater(Wavefunction):
     """
-    Log-wavefunction for a Slater determinant whose orbitals are initialized as
-    truncated Fourier representations of periodized Gaussian orbitals centered
-    at the provided positions.
+    Slater determinant with trainable Gaussian orbital widths initialized at r_ws.
 
-    IMPORTANT: This code assumes that the k-points come in order like
-               [0, k1, -k1, k2, -k2, ...]
+    IMPORTANT: Assumes k-points ordered as [0, k1, -k1, k2, -k2, ...].
     """
     N: int
     dim: int
     r_ws: float
-    kpoints: jnp.ndarray   # (Nk, dim)
-    centers: jnp.ndarray   # (N, dim)
+    kpoints: jnp.ndarray  # (Nk, dim)
+    centers: jnp.ndarray  # (N, dim)
 
     def setup(self):
 
@@ -483,7 +483,7 @@ class LogGaussianSlater(Wavefunction):
             )
         )
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
 
         def makeBasisRow(ri):
             def localKpointFunction(k, c_switch, s_switch):
@@ -494,173 +494,182 @@ class LogGaussianSlater(Wavefunction):
                 self.kpoints, self.cos_switch, self.sin_switch
             )
 
-        basisMatrix = jax.vmap(makeBasisRow)(rs)      # (N, Nk)
+        basisMatrix = jax.vmap(makeBasisRow)(rs)       # (N, Nk)
         alpha = jnp.exp(self.log_alpha)
-        coeffs = generateGaussianMPCoeffs(
+        coeffs = generate_gaussian_mp_coeffs(
             self.kpoints, self.centers, alpha
-        )                                             # (Nk, N)
-        orbitalMatrix = jnp.dot(basisMatrix, coeffs)  # (N, N)
+        )                                              # (Nk, N)
+        orbitalMatrix = jnp.dot(basisMatrix, coeffs)   # (N, N)
 
         return jnp.linalg.slogdet(orbitalMatrix)[1]
 
-def coulombYukawa(r_real, r_frac, A, F):
+
+def cy_jastrow_default_as(
+    spins: tuple, lattice: jnp.ndarray
+) -> jnp.ndarray:
     """
-    Coulomb-Yukawa Jastrow with anisotropic Decay.
-    
-    Args:
-        r_real: The physical distance (for the Coulomb/Yukawa interaction).
-        r_frac: The norm of the fractional distance vector. 
-                This is used to make sure the Jastrow dies at the unit cell
-                boundaries.
+    RPA estimate of the CY Jastrow A parameters for the uniform electron gas.
+    Returns shape (2,) array [A_same_spin, A_diff_spin], both set to 1/sqrt(4πn).
     """
-    r_safe = jnp.where(r_real < 1e-12, 1.0, r_real) 
-    cy = (A / r_safe) * (1 - jnp.exp(-r_safe / F))
-    
-    r_cut_frac = 0.5
-    x = jnp.clip(r_frac / r_cut_frac, a_min=0.0, a_max=1.0 - 1e-5)
-    decay = jnp.exp(1 - 1 / (1 - x**2))
-    
-    return cy * decay
+    N = spins[0] + spins[1]
+    volume = jnp.abs(jnp.linalg.det(lattice))
+    n = N / volume
+    return jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
 
-def cyJastrowForwardFunction(rs, spins, lattice, rec_lattice, As):
 
-        N = rs.shape[0]
+def _coulomb_yukawa(
+    r_real: jnp.ndarray, A: jnp.ndarray, F: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Coulomb-Yukawa pair potential u(r) = (A/r)(1 - exp(-r/F)).
 
-        A_same = jnp.abs(As[0])
-        A_diff = jnp.abs(As[1])
-        
-        F_same = jnp.sqrt(2 * A_same)
-        F_diff = jnp.sqrt(A_diff)
+    The cusp conditions fix F from A: F_same = sqrt(2A), F_diff = sqrt(A).
+    No boundary decay is applied; smooth periodicity is ensured upstream by
+    computing r_real via the sine-MIC approximation.
+    """
+    r_safe = jnp.where(r_real < 1e-12, 1.0, r_real)
+    return (A / r_safe) * (1 - jnp.exp(-r_safe / F))
 
-        disp_real_raw = rs[:,None,:] - rs[None,:,:]
-        disp_frac = jnp.dot(disp_real_raw, rec_lattice)
-        disp_frac = (disp_frac + 0.5) % 1.0 - 0.5
-        disp_real_mic = jnp.dot(disp_frac, lattice)
 
-        eye_mask = jnp.eye(N)[:,:,None]
-        r_ij_real = jnp.linalg.norm(disp_real_mic + eye_mask, axis=-1)
-        r_ij_frac = jnp.linalg.norm(disp_frac + eye_mask, axis=-1)
-        
-        n_up, n_down = spins
-        spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
-        
-        mask_same = spin_mask[:,None] == spin_mask[None,:]
-        mask_diff = spin_mask[:,None] != spin_mask[None,:]
-        eye = jnp.eye(N, dtype=bool)
-        mask_same = mask_same & (~eye)
-        
-        val_same = coulombYukawa(r_ij_real, r_ij_frac, A_same, F_same)
-        val_same = jnp.where(mask_same, val_same, 0.0)
+def _cy_jastrow_forward(
+    rs: jnp.ndarray,
+    spins: tuple,
+    lattice: jnp.ndarray,
+    rec_lattice: jnp.ndarray,
+    As: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Forward pass for the Coulomb-Yukawa Jastrow factor.
 
-        val_diff = coulombYukawa(r_ij_real, r_ij_frac, A_diff, F_diff)
-        val_diff = jnp.where(mask_diff, val_diff, 0.0)
+    Cusp conditions: F_same = sqrt(2 A_same), F_diff = sqrt(A_diff).
 
-        return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
+    Distances are computed via the sine-MIC approximation:
+        disp_mic = sin(π · disp_frac) @ lattice / π
+    which is smooth and periodic across cell boundaries (no folx-incompatible
+    rem/% operation), and equals the true MIC displacement for small separations.
+    """
+    N = rs.shape[0]
+
+    A_same = jnp.abs(As[0])
+    A_diff = jnp.abs(As[1])
+
+    F_same = jnp.sqrt(2 * A_same)
+    F_diff = jnp.sqrt(A_diff)
+
+    disp_raw = rs[:, None, :] - rs[None, :, :]          # (N, N, dim)
+    disp_frac = disp_raw @ rec_lattice                   # (N, N, dim)
+    sin_disp_frac = jnp.sin(jnp.pi * disp_frac)         # (N, N, dim)
+
+    eye_mask = jnp.eye(N, dtype=rs.dtype)[:, :, None]   # diagonal protection
+    disp_mic = (sin_disp_frac @ lattice) / jnp.pi        # (N, N, dim)
+    r_ij = jnp.linalg.norm(disp_mic + eye_mask, axis=-1) # (N, N)
+
+    n_up, n_down = spins
+    spin_mask = jnp.concatenate([jnp.zeros(n_up, dtype=int), jnp.ones(n_down, dtype=int)])
+
+    mask_same = spin_mask[:, None] == spin_mask[None, :]
+    mask_diff = spin_mask[:, None] != spin_mask[None, :]
+    eye = jnp.eye(N, dtype=bool)
+    mask_same = mask_same & (~eye)
+
+    val_same = _coulomb_yukawa(r_ij, A_same, F_same)
+    val_same = jnp.where(mask_same, val_same, 0.0)
+
+    val_diff = _coulomb_yukawa(r_ij, A_diff, F_diff)
+    val_diff = jnp.where(mask_diff, val_diff, 0.0)
+
+    return -0.5 * (jnp.sum(val_same) + jnp.sum(val_diff))
+
 
 class LogCYJastrow(Wavefunction):
     """
-    Creates a log-wavefunction that is a Coulomb-Yukawa Jastrow term. The same
-    and different spin electrons are handled by different $A$ parameters.
-    Hence, this wavefunction has two variational parameters.
+    Coulomb-Yukawa Jastrow factor with trainable A parameters.
 
-    The conventional $F$ parameters are set by the cusp conditions.
-
-    NOTE: In this implementation, we always take the absolute values of the $A$
-    parameters. This is so that even if negative values are encountered during
-    optimization, the resulting wavefunction remains physical.
+    Same-spin and opposite-spin pairs use separate A values (parameter key
+    "As_same_diff"). F parameters are set by cusp conditions. Absolute values
+    of A are taken so optimization never produces an unphysical sign.
     """
-    spins : (int,int)
+    spins: tuple
     lattice: jnp.ndarray
 
     def setup(self):
-
-        N = self.spins[0] + self.spins[1]
-        volume = jnp.abs(jnp.linalg.det(self.lattice))
-        n = N / volume
-
         self.rec_lattice = jnp.linalg.inv(self.lattice)
         self.As = self.param(
             "As_same_diff",
-            lambda rng: jnp.full(2, 1.0 / jnp.sqrt(4 * jnp.pi * n))
+            lambda _: cy_jastrow_default_as(self.spins, self.lattice)
         )
 
-    def __call__(self, rs):
-        return cyJastrowForwardFunction(
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
+        return _cy_jastrow_forward(
             rs, self.spins, self.lattice, self.rec_lattice, self.As
         )
+
 
 class LogFixedCYJastrow(Wavefunction):
-    """
-    Same as LogCYJastrow but the $A$ parameters are *fixed* at initialization.
-    """
-    spins : (int,int)
+    """Same as LogCYJastrow but A parameters are fixed at initialization."""
+    spins: tuple
     lattice: jnp.ndarray
-    As : jnp.ndarray
+    As: jnp.ndarray
 
     def setup(self):
-        volume = jnp.abs(jnp.linalg.det(self.lattice))
         self.rec_lattice = jnp.linalg.inv(self.lattice)
 
-    def __call__(self, rs):
-        return cyJastrowForwardFunction(
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
+        return _cy_jastrow_forward(
             rs, self.spins, self.lattice, self.rec_lattice, self.As
         )
+
 
 class LogSimpleSlaters(Wavefunction):
     """
-    Creates a log-wavefunction that is the product of two simple Slater
-    determinant with the lowest k-points filled.
-
-    There are no variational parameters.
+    Product of two fixed Slater determinants (one per spin) with no trainable params.
     """
-    spins : (int,int)
-    dim : int
-    kpoints : jnp.ndarray
+    spins: tuple
+    dim: int
+    kpoints: jnp.ndarray
 
     def setup(self):
         self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
 
-    def __call__(self, rs):
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
+        slaterUp = self.slaterUp(rs[:self.spins[0], :])
+        slaterDown = self.slaterDown(rs[self.spins[0]:, :])
         return slaterUp + slaterDown
+
 
 class LogSlaterCYJastrow(Wavefunction):
     """
-    Creates a log-wavefunction that is the product of two simple Slater
-    determinant with the lowest k-points filled and a Coulomb-Yukawa Jastrow.
-
-    There are 2 variational parameters, both in the Jastrow.
+    Product of two fixed Slater determinants and a trainable CY Jastrow (2 params).
     """
-    spins : (int,int)
-    dim : int
+    spins: tuple
+    dim: int
     lattice: jnp.ndarray
-    kpoints : jnp.ndarray
+    kpoints: jnp.ndarray
 
     def setup(self):
         self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
         self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
 
-    def __call__(self, rs):
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
+        slaterUp = self.slaterUp(rs[:self.spins[0], :])
+        slaterDown = self.slaterDown(rs[self.spins[0]:, :])
         CYJastrow = self.CYJastrow(rs)
         return slaterUp + slaterDown + CYJastrow
 
-def generateFeatures(rs, spins, lattice):
-    """
-    Takes in electron positions and generates two-body features that contain
-    two-body information about electron displacements and spin matching.
-    Importantly, the features are continuous at the provided unit cell
-    boundaries, which make them useful as features for neural layers.
 
-    If `rs` is shape (N,dim), then the output is shape (N,N,2*dim+2).
+def generate_features(
+    rs: jnp.ndarray, spins: tuple, lattice: jnp.ndarray
+) -> jnp.ndarray:
     """
-        
-    disps = rs[:,None,:] - rs[None,:,:]  # (N, N, dim)
-    mask = ~jnp.eye(disps.shape[0], dtype=bool)[:,:,None]
+    Generates smooth, periodic two-body features from electron positions.
+
+    Returns shape (N, N, 2*dim+2) containing cosine/sine displacements,
+    sine-magnitude distances, and spin-match indicators.
+    """
+    disps = rs[:, None, :] - rs[None, :, :]  # (N, N, dim)
+    mask = ~jnp.eye(disps.shape[0], dtype=bool)[:, :, None]
     disps = jnp.where(mask, disps, 0.0)
 
     recLattice = jnp.linalg.inv(lattice)
@@ -672,12 +681,12 @@ def generateFeatures(rs, spins, lattice):
         jnp.sin(jnp.pi * fracDisps), axis=-1, keepdims=True
     )
     sinDispsMag = jnp.where(mask, sinDispsMag, 0.0)
-    
+
     N = spins[0] + spins[1]
     electronIdxs = jnp.arange(N)
     electronSpins = jnp.where(electronIdxs < spins[0], 1, -1)
-    matchMatrix = jnp.outer(electronSpins, electronSpins)[:,:,None]
-    
+    matchMatrix = jnp.outer(electronSpins, electronSpins)[:, :, None]
+
     v_ij = jnp.concatenate(
         [cosDisps, sinDisps, sinDispsMag, matchMatrix],
         axis=-1
@@ -685,87 +694,80 @@ def generateFeatures(rs, spins, lattice):
 
     return v_ij
 
+
 class LogTwoBodySJ(Wavefunction):
     """
-    Two-Body Slater-Jastrow wavefunction for arbitrary (skewed) periodic cells.
-    
-    Args:
-        lattice: (D, D) matrix defining the lattice vectors (rows).
-                 e.g. [[Lx, 0], [Tx, Ty]] for a 2D tilted cell.
-        kpoints: (N, D) matrix with the occupied k-points for the Slater
-                 determinant.
+    Slater-Jastrow wavefunction: two fixed Slater determinants, a trainable CY
+    Jastrow, and a two-body neural Jastrow term.
     """
-    spins : (int,int)
-    dim : int
-    lattice : jnp.ndarray
-    kpoints : jnp.ndarray
-    hiddenFeatures : int
+    spins: tuple
+    dim: int
+    lattice: jnp.ndarray
+    kpoints: jnp.ndarray
+    hiddenFeatures: int
 
     def setup(self):
 
         self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
         self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
-        
+
         self.linear1 = nn.Dense(self.hiddenFeatures)
         self.linear2 = nn.Dense(
             1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
         )
 
-    def __call__(self, rs):
-        
-        slaterUp = self.slaterUp(rs[:self.spins[0],:])
-        slaterDown = self.slaterDown(rs[self.spins[0]:,:])
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
+
+        slaterUp = self.slaterUp(rs[:self.spins[0], :])
+        slaterDown = self.slaterDown(rs[self.spins[0]:, :])
         CYJastrow = self.CYJastrow(rs)
 
-        v_ij = generateFeatures(rs, self.spins, self.lattice)   # (N,N,2*dim+2)
-        n_ij = self.linear2(nn.swish(self.linear1(v_ij)))       # (N,N,1)
+        v_ij = generate_features(rs, self.spins, self.lattice)   # (N, N, 2*dim+2)
+        n_ij = self.linear2(nn.swish(self.linear1(v_ij)))        # (N, N, 1)
         neuralJastrow = 0.5 * jnp.sum(n_ij) / sum(self.spins)
-        
+
         return slaterUp + slaterDown + CYJastrow + neuralJastrow
+
 
 class LogTwoBodySJB(Wavefunction):
     """
-    Two-Body Slater-Jastrow-Backflow wavefunction for arbitrary (skewed)
-    periodic cells.
-    
-    Args:
-        lattice: (D, D) matrix defining the lattice vectors (rows).
-                 e.g. [[Lx, 0], [Tx, Ty]] for a 2D tilted cell.
-        kpoints: (N, D) matrix with the occupied k-points for the Slater
-                 determinant.
+    Slater-Jastrow-Backflow wavefunction: two fixed Slater determinants (applied
+    to backflow-shifted positions), a trainable CY Jastrow, and a two-body
+    neural Jastrow term. Output features of a single two-body network provide
+    both backflow displacements and the neural Jastrow.
     """
-    spins : (int,int)
-    dim : int
-    lattice : jnp.ndarray
-    kpoints : jnp.ndarray
-    hiddenFeatures : int
+    spins: tuple
+    dim: int
+    lattice: jnp.ndarray
+    kpoints: jnp.ndarray
+    hiddenFeatures: int
 
     def setup(self):
-        
+
         self.slaterUp = LogSimpleSlater(self.spins[0], self.dim, self.kpoints)
         self.slaterDown = LogSimpleSlater(self.spins[1], self.dim, self.kpoints)
         self.CYJastrow = LogCYJastrow(self.spins, self.lattice)
-        
+
         self.linear1 = nn.Dense(self.hiddenFeatures)
         self.linear2 = nn.Dense(
-            self.dim+1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
+            self.dim + 1, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.zeros
         )
 
-    def __call__(self, rs):
+    def __call__(self, rs: jnp.ndarray) -> jnp.ndarray:
 
-        v_ij = generateFeatures(rs, self.spins, self.lattice)   # (N,N,2*dim+2)
-        n_ij = self.linear2(nn.swish(self.linear1(v_ij)))       # (N,N,dim+1)
+        v_ij = generate_features(rs, self.spins, self.lattice)   # (N, N, 2*dim+2)
+        n_ij = self.linear2(nn.swish(self.linear1(v_ij)))        # (N, N, dim+1)
 
-        jastrowFeatures = n_ij[:,:,0]                           # (N,N)
-        backflowFeatures = n_ij[:,:,1:]                         # (N,N,dim)
+        jastrowFeatures = n_ij[:, :, 0]                          # (N, N)
+        backflowFeatures = n_ij[:, :, 1:]                        # (N, N, dim)
 
-        backflow = jnp.average(backflowFeatures, axis=1)        # (N,dim)
+        backflow = jnp.average(backflowFeatures, axis=1)         # (N, dim)
         xs = rs + backflow
-        
-        slaterUp = self.slaterUp(xs[:self.spins[0],:])
-        slaterDown = self.slaterDown(xs[self.spins[0]:,:])
+
+        slaterUp = self.slaterUp(xs[:self.spins[0], :])
+        slaterDown = self.slaterDown(xs[self.spins[0]:, :])
         CYJastrow = self.CYJastrow(rs)
         neuralJastrow = 0.5 * jnp.sum(jastrowFeatures) / sum(self.spins)
-        
+
         return slaterUp + slaterDown + CYJastrow + neuralJastrow

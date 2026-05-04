@@ -1,22 +1,24 @@
 import sys, os
 
 sys.path.append("/burg-archive/ccce/users/phr2114/vmc")
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 #os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 #os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
+from flax.core.frozen_dict import freeze, unfreeze
 import numpy as np
 
-import wavefunctions, hamiltonian, trajectory, optimization
+import wavefunctions, folx_hamiltonian, trajectory, optimization
 
-jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_enable_x64", True)
 
 import time
 
 print("STARTING\n\n")
 
-debugFlag = True
 start = time.time()
 
 ###############################################################################
@@ -24,9 +26,10 @@ start = time.time()
 ###############################################################################
 
 r_ws = xxxRSxxx
-N = 14
+N = 56
 tau = 1.25
-dim = 3
+dim = 2
+numKpoints = 169
 
 walkers = 1024
 
@@ -39,16 +42,16 @@ NUp = N // 2
 NDown = N - NUp
 spins = ( NUp , NDown )
 
-lattice = wavefunctions.computeLattice(
-    N, r_ws, dim,
-    basis_matrix=jnp.eye(dim)
+lattice = wavefunctions.compute_lattice(
+    N, r_ws, dim, basis_matrix=jnp.array([[7,0],[0,4*jnp.sqrt(3)]])
 )
-kpoints = wavefunctions.genKpoints(jnp.maximum(NUp, NDown), lattice, dim)
+kpoints = wavefunctions.gen_k_points(numKpoints, lattice, dim)
 
 ( acceptMin , acceptMax ) = ( 0.55 , 0.65 )
 
 T = 1000
 diagonalShift = 1e-3
+mu = 0.9
 
 
 ###############################################################################
@@ -56,9 +59,9 @@ diagonalShift = 1e-3
 ###############################################################################
 
 if not os.path.exists("hyperparameters.txt"):
-    
+
     hyperparameters = np.full(1, np.nan)
-    hyperparameters[0] = optimization.logSample(xxxLRMIN0xxx,xxxLRMAX0xxx)
+    hyperparameters[0] = optimization.log_sample(xxxLRMIN0xxx,xxxLRMAX0xxx)
     np.savetxt("hyperparameters.txt", hyperparameters)
 
 hyperparameters = jnp.array(np.loadtxt("hyperparameters.txt"), ndmin=1)
@@ -72,23 +75,44 @@ eta0 = hyperparameters[0]
 #   Creating wavefunction, walker updater, optimizer, and local energy        #
 ###############################################################################
 
-wavefunction = wavefunctions.LogSlaterCYJastrow(spins, dim, lattice, kpoints)
+rng = jax.random.PRNGKey(558)
+rng, rs_rng, init_rng = jax.random.split(rng, 3)
+
+centers = trajectory.generate_striped_afm(spins, lattice, dim, gridShape=(7,4))
+(upCenters,downCenters) = centers[:spins[0]], centers[spins[0]:]
+rs = centers[None,:,:] + (r_ws / 10) * jax.random.normal(rs_rng, shape=(walkers,N,dim))
+
+alpha = 1 / (r_ws ** 2.0)
+upCoeffs = wavefunctions.generate_gaussian_mp_coeffs(kpoints, upCenters, alpha)
+downCoeffs = wavefunctions.generate_gaussian_mp_coeffs(kpoints, downCenters, alpha)
+
+wavefunction = wavefunctions.LogSlaterCYJastrow(spins, dim, lattice, kpoints[:spins[0]])
 mala = trajectory.MALAUpdater(wavefunction, r_ws)
 if dim == 2:
-    localEnergy = hamiltonian.LocalEnergyUEG2D(wavefunction, lattice)
+    localEnergy = folx_hamiltonian.LocalEnergyUEG2D(wavefunction, lattice, sparsity_threshold=6)
 elif dim == 3:
-    localEnergy = hamiltonian.LocalEnergyUEG(wavefunction, lattice)
-optimizer = optimization.StochasticReconfiguration(wavefunction, localEnergy)
+    localEnergy = folx_hamiltonian.LocalEnergyUEG3D(wavefunction, lattice, sparsity_threshold=6)
+optimizer = optimization.StochasticReconfiguration(
+    wavefunction, localEnergy, mode='normal'
+)
 
-updateWalkerPositions = jax.jit(mala.updateBatch)
+updateWalkerPositions = jax.jit(mala.update_batch)
 computeEnergies = jax.jit(localEnergy.batch)
 updateParameters = jax.jit(optimizer)
 
-rng = jax.random.PRNGKey(558)
+parameters = wavefunction.init_batch(init_rng, rs)
 
-rng, rs_rng, init_rng = jax.random.split(rng, 3)
-rs = trajectory.wignerCrystal(spins, lattice, r_ws, walkers, rs_rng, dim=dim)
-parameters = wavefunction.initBatch(init_rng, rs)
+"""
+parameters = unfreeze(parameters)
+tunedAs = wavefunctions.load_parameters(
+    "/burg-archive/ccce/users/phr2114/vmc/gaussian-reference/CYJastrow/rs{}_best/parameters.msgpack".format(str(r_ws))
+)['params']['CYJastrow']['As_same_diff']
+parameters['params']['CYJastrow']['As_same_diff'] = tunedAs
+parameters = freeze(parameters)
+"""
+
+print("NUM PARAMETERS: " + str(optimization.flatten(parameters).size))
+print("DTYPE: " + str(rs.dtype))
 
 
 ###############################################################################
@@ -99,7 +123,6 @@ print("Starting equilibration...")
 
 rng = jax.random.PRNGKey(1126)
 
-startRs = rs
 acceptRates = [np.nan]
 acceptArrays = np.zeros(walkers)
 
@@ -113,10 +136,10 @@ for dt in range(eqSteps):
     rng, traj_rng = jax.random.split(rng, 2)
     newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
 
-    acceptRate = trajectory.acceptanceRate(rs, newRs)
-    
+    acceptRate = trajectory.acceptance_rate(rs, newRs)
+
     acceptRates.append(acceptRate)
-    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
+    acceptArrays += trajectory.acceptance_array(rs, newRs) / eqSteps
 
     if acceptRate < acceptMin:
         tau = tau * 0.9
@@ -131,9 +154,6 @@ print(np.sort(acceptArrays)[:10])
 
 if np.min(acceptArrays) < 0.4:
     np.savetxt("FAILED_EQUILIBRATE", [])
-    np.save("big_acceptArrays.npy", acceptArrays)
-    np.save("big_startRs.npy", startRs)
-    np.save("big_endRs.npy", rs)
     raise Exception("DEAD WALKER DURING EQUILIBRATION")
 
 
@@ -141,28 +161,34 @@ if np.min(acceptArrays) < 0.4:
 #   Parameter optimization                                                    #
 ###############################################################################
 
-
 print("Starting optimization...")
 
 rng = jax.random.PRNGKey(151)
 
-startRs = rs
+history = 0.0
+
+energyTraj = np.full(trainSteps, np.nan)
+
+checkpointEnergies = []
+checkpointParameters = []
 
 for dt in range(trainSteps):
 
     localLearningRate = eta0 / (1 + (dt / T))
-    ( maxNorm , currentEnergies , newParameters ) = updateParameters(
-        parameters, rs, localLearningRate, diagonalShift
+    ( maxNorm , currentEnergies , newParameters , history ) = updateParameters(
+        parameters, rs, localLearningRate, diagonalShift, mu, history
     )
 
-    if optimization.hasnan(newParameters):
-        np.savetxt("FAILED_REEQUILIBRATE", [])
-        wavefunctions.saveParameters(
-            "parameters_failed.msgpack", parameters
-        )
-        np.save("big_startRs.npy", startRs)
-        np.save("big_endRs.npy", rs)
+    if optimization.has_nan(newParameters):
+        np.savetxt("NAN_OPTIMIZATION", [])
         raise Exception("Parameters have somehow NaNed...")
+
+    currentEnergy = jnp.average(currentEnergies) / N
+    energyTraj[dt] = currentEnergy
+
+    if (dt + 1) % 100 == 0:
+        checkpointEnergies.append(currentEnergy)
+        checkpointParameters.append(newParameters)
 
     parameters = newParameters
 
@@ -173,37 +199,40 @@ for dt in range(trainSteps):
         rng, traj_rng = jax.random.split(rng, 2)
         newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
 
-        acceptRate = trajectory.acceptanceRate(rs, newRs)
+        acceptRate = trajectory.acceptance_rate(rs, newRs)
         if acceptRate < acceptMin:
             tau = tau * 0.9
         elif acceptRate > acceptMax:
             tau = tau * 1.1
 
-        acceptArrays += trajectory.acceptanceArray(rs, newRs) / trainEqSteps
+        acceptArrays += trajectory.acceptance_array(rs, newRs) / trainEqSteps
 
         rs = newRs
 
     print("Step {:5d}   Energy: {:.5f}   Norm: {:5}   Min Acc: {:.3f}   Avg Acc: {:.3f}   Param Norm: {:.5f}".format(
-        dt, jnp.average(currentEnergies) / N, str(maxNorm),
+        dt, currentEnergy, str(maxNorm),
         np.min(acceptArrays), np.average(acceptArrays), np.linalg.norm(optimization.flatten(parameters))
     ))
 
 print("Finished optimization!\n")
 
-wavefunctions.saveParameters("parameters.msgpack", parameters)
+checkpointEnergies = np.array(checkpointEnergies)
+parameters = checkpointParameters[np.argmin(checkpointEnergies)]
+
+wavefunctions.save_parameters("parameters.msgpack", parameters)
+np.savetxt("energy_traj.txt", energyTraj)
 
 ###############################################################################
 #   Equilibrating walkers before energy evaluations                           #
 ###############################################################################
 
 rng, rs_rng = jax.random.split(rng, 2)
-rs = trajectory.wignerCrystal(spins, lattice, r_ws, walkers, rs_rng, dim=dim)
+rs = centers[None,:,:] + (r_ws / 10) * jax.random.normal(rs_rng, shape=(walkers,N,dim))
 
 print("Starting equilibration...")
 
 rng = jax.random.PRNGKey(386)
 
-startRs = rs
 acceptRates = [np.nan]
 acceptArrays = np.zeros(walkers)
 
@@ -217,10 +246,10 @@ for dt in range(eqSteps):
     rng, traj_rng = jax.random.split(rng, 2)
     newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
 
-    acceptRate = trajectory.acceptanceRate(rs, newRs)
-    
+    acceptRate = trajectory.acceptance_rate(rs, newRs)
+
     acceptRates.append(acceptRate)
-    acceptArrays += trajectory.acceptanceArray(rs, newRs) / eqSteps
+    acceptArrays += trajectory.acceptance_array(rs, newRs) / eqSteps
 
     if acceptRate < acceptMin:
         tau = tau * 0.9
@@ -235,9 +264,6 @@ print(np.sort(acceptArrays)[:10])
 
 if np.min(acceptArrays) < 0.4:
     np.savetxt("FAILED_REEQUILIBRATE", [])
-    np.save("big_acceptArrays.npy", acceptArrays)
-    np.save("big_startRs.npy", startRs)
-    np.save("big_endRs.npy", rs)
     raise Exception("DEAD WALKER DURING RE-EQUILIBRATION")
 
 
@@ -245,19 +271,17 @@ if np.min(acceptArrays) < 0.4:
 #   Energy evaluation                                                         #
 ###############################################################################
 
-
 print("Starting energy evaluation...")
 
 rng = jax.random.PRNGKey(493)
 
-startRs = rs
 acceptRates = [np.nan]
 acceptArrays = np.zeros(walkers)
 energies = np.full((evalSteps,walkers),np.nan)
 
 for dt in range(evalSteps):
 
-    if dt % 1000 == 0:
+    if dt % 100 == 0:
         avgRate = np.average(np.array(acceptRates))
         acceptRates = []
         print("Step {:5d}   Acc Rate {:4f}   tau = {:.5f}".format(dt,avgRate,tau))
@@ -266,10 +290,10 @@ for dt in range(evalSteps):
     energies[dt,:] = computeEnergies(parameters, rs) / N
     newRs = updateWalkerPositions(parameters, rs, traj_rng, tau)
 
-    acceptRate = trajectory.acceptanceRate(rs, newRs)
-    
+    acceptRate = trajectory.acceptance_rate(rs, newRs)
+
     acceptRates.append(acceptRate)
-    acceptArrays += trajectory.acceptanceArray(rs, newRs) / evalSteps
+    acceptArrays += trajectory.acceptance_array(rs, newRs) / evalSteps
 
     rs = newRs
 
@@ -281,17 +305,13 @@ print(np.sort(acceptArrays)[:10])
 
 if np.min(acceptArrays) < 0.4:
     np.savetxt("DEADWALKER", [])
-    np.save("big_acceptArrays.npy", acceptArrays)
-    np.save("big_startRs.npy", startRs)
-    np.save("big_endRs.npy", rs)
     raise Exception("DEAD WALKER DURING EVALUATION")
 
 ###############################################################################
 #   Write relevant results out to files                                       #
 ###############################################################################
 
-wavefunctions.saveParameters("parameters.msgpack", parameters)
+wavefunctions.save_parameters("parameters.msgpack", parameters)
 np.savetxt("time.txt", [(time.time() - start) / 3600])
 np.savetxt("tau.txt", [tau])
-np.save("big_energies.npy", energies)
-trajectory.blockingAnalysis(averageEnergies, writeQ="statistics.txt")
+trajectory.blocking_analysis(averageEnergies, writeQ="statistics.txt")

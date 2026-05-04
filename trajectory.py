@@ -4,203 +4,206 @@ import numpy as np
 
 import os, re
 
+
 class MetropolisUpdater:
 
     def __init__(self, logWavefunction):
         self.logWavefunction = logWavefunction.apply
-        self.updateWalkers = jax.vmap(
-            self.updateConfiguration,
-            in_axes=(None,0,0,None)
+        self._update_walkers = jax.vmap(
+            self._update_configuration,
+            in_axes=(None, 0, 0, None)
         )
 
-    def updateConfiguration(self, parameters, rs1, rng, tau):
-                
+    def _update_configuration(
+        self, parameters, rs1: jnp.ndarray, rng, tau: float
+    ) -> jnp.ndarray:
+
         shiftRng, acceptRng = jax.random.split(rng, 2)
-        
+
         randomShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
         rs2 = rs1 + randomShift
-        
+
         probRatio = jnp.exp(
-            2 * (self.logWavefunction(parameters,rs2) - self.logWavefunction(parameters,rs1))
+            2 * (self.logWavefunction(parameters, rs2) - self.logWavefunction(parameters, rs1))
         )
         acceptProb = jnp.minimum(1., probRatio)
         accept = jax.random.bernoulli(acceptRng, acceptProb)
-        
+
         return jnp.where(accept, rs2, rs1)
 
-    def updateBatch(self, parameters, rs, rng, tau):
+    def update_batch(
+        self, parameters, rs: jnp.ndarray, rng, tau: float
+    ) -> jnp.ndarray:
         walkers = rs.shape[0]
         rngs = jax.random.split(rng, walkers)
-        return self.updateWalkers(parameters, rs, rngs, tau)
+        return self._update_walkers(parameters, rs, rngs, tau)
+
 
 class MALAUpdater:
 
-    def __init__(self, logWavefunction, r_ws, clipGradients=True):
+    def __init__(self, logWavefunction, r_ws: float, clipGradients: bool = True):
         self.logWavefunction = logWavefunction.apply
         self.r_ws = r_ws
         self.gradLogWavefunction = jax.grad(logWavefunction.apply, argnums=1)
         self.clipGradients = clipGradients
-        self.updateWalkers = jax.vmap(
-            self.updateConfiguration,
-            in_axes=(None,0,0,None)
+        self._update_walkers = jax.vmap(
+            self._update_configuration,
+            in_axes=(None, 0, 0, None)
         )
 
-    def updateConfiguration(self, parameters, rs1, rng, tau):
+    def _update_configuration(
+        self, parameters, rs1: jnp.ndarray, rng, tau: float
+    ) -> jnp.ndarray:
 
         def clip(jnpArray):
-            # Scales the list of vecs in `jnpArray` to have norm <= maxvalue
             maxValue = self.r_ws / 25
             norms = jnp.linalg.norm(jnpArray, axis=-1, keepdims=True)
             scale = jnp.minimum(1.0, maxValue / (norms + 1e-12))
             return jnpArray * scale
-    
+
         def proposalProb(Ri, Rf):
-            # Returns (unnormalized) proposal probability P(Rf | Ri)
-            localGrad = self.gradLogWavefunction(parameters,Ri)
+            localGrad = self.gradLogWavefunction(parameters, Ri)
             gradShift = localGrad * tau
             if self.clipGradients:
                 gradShift = clip(gradShift)
             deviation = Rf - Ri - gradShift
-            return jnp.exp(-jnp.sum(deviation**2) / (2 * tau))
-                
+            return jnp.exp(-jnp.sum(deviation ** 2) / (2 * tau))
+
         shiftRng, acceptRng = jax.random.split(rng, 2)
 
         localGrad = self.gradLogWavefunction(parameters, rs1)
         gradShift = localGrad * tau
         if self.clipGradients:
             gradShift = clip(gradShift)
-        
+
         randomShift = jax.random.normal(shiftRng, shape=rs1.shape) * jnp.sqrt(tau)
         rs2 = rs1 + gradShift + randomShift
 
-        proposalRatio = proposalProb(rs2,rs1) / proposalProb(rs1,rs2)
+        proposalRatio = proposalProb(rs2, rs1) / proposalProb(rs1, rs2)
         probRatio = jnp.exp(
-            2. * (self.logWavefunction(parameters,rs2) - self.logWavefunction(parameters,rs1))
+            2. * (self.logWavefunction(parameters, rs2) - self.logWavefunction(parameters, rs1))
         )
         acceptProb = jnp.minimum(1., proposalRatio * probRatio)
         accept = jax.random.bernoulli(acceptRng, acceptProb)
-        
+
         return jnp.where(accept, rs2, rs1)
 
-    def updateBatch(self, parameters, rs, rng, tau):
+    def update_batch(
+        self, parameters, rs: jnp.ndarray, rng, tau: float
+    ) -> jnp.ndarray:
         walkers = rs.shape[0]
         rngs = jax.random.split(rng, walkers)
-        return self.updateWalkers(parameters, rs, rngs, tau)
+        return self._update_walkers(parameters, rs, rngs, tau)
 
-def generateBCC(spins, lattice, dim):
+
+def generate_bcc(spins: tuple, lattice: jnp.ndarray, dim: int) -> jnp.ndarray:
     """
     Returns the lattice positions of the BCC-like Wigner crystal phase in 3D.
-    
-    Args:
-        spins: Tuple (n_up, n_down)
-        lattice: (dim, dim) matrix where rows are lattice vectors.
-                 e.g. [[Lx, 0], [Tx, Ty]]
-        dim: must be 3 for BCC-like lattice
-    """
 
+    Args:
+        spins: Tuple (n_up, n_down).
+        lattice: (dim, dim) matrix where rows are lattice vectors.
+        dim: must be 3 for BCC-like lattice.
+    """
     if dim != 3:
         raise Exception("BCC-like crystal phase is a 3D phase.")
-        
-    # BCC-LIKE LATTICE
-    
-    (NUp,NDown) = spins
-    
-    numLatticePoints = int(jnp.ceil(jnp.maximum(NUp, NDown) ** (1/3)))
-    
+
+    (NUp, NDown) = spins
+
+    numLatticePoints = int(jnp.ceil(jnp.maximum(NUp, NDown) ** (1 / 3)))
+
     points = jnp.linspace(0, 1, numLatticePoints, endpoint=False)
-    
-    grids = jnp.meshgrid(*([points]*dim), indexing="ij")
+
+    grids = jnp.meshgrid(*([points] * dim), indexing="ij")
     frac_up = jnp.stack(grids, axis=-1).reshape(-1, dim)
-    
+
     frac_shift = (1.0 / numLatticePoints) / 2.0
     frac_down = (frac_up + frac_shift) % 1.0
-    
+
     upPositions = frac_up @ lattice
     downPositions = frac_down @ lattice
-    
+
     coordinates = jnp.concatenate([
         upPositions[:NUp], downPositions[:NDown]
     ], axis=0)
 
     return coordinates
 
-def generateStripedAFM(spins, lattice, dim, gridShape=None):
+
+def generate_striped_afm(
+    spins: tuple, lattice: jnp.ndarray, dim: int, gridShape=None
+) -> jnp.ndarray:
     """
     Returns the lattice positions of the striped anti-ferromagnetic (AFM)
     Wigner crystal phase in 2D.
-    
+
     Args:
-        spins: Tuple (n_up, n_down)
+        spins: Tuple (n_up, n_down).
         lattice: (dim, dim) matrix where rows are lattice vectors.
-                 e.g. [[Lx, 0], [Tx, Ty]]
-        dim: must be 2 for striped AFM lattice
-        gridShape: specifies number of grid points along each dimension
+        dim: must be 2 for striped AFM lattice.
+        gridShape: specifies number of grid points along each dimension.
     """
-    
     NUp = spins[0]
     NDown = spins[1]
 
     if dim != 2:
         raise Exception("Striped AFM phase is a 2D phase.")
-        
-    # STRIPED TRIANGULAR PHASE
 
     if gridShape is None:
         n_side = int(jnp.ceil(jnp.sqrt(jnp.maximum(NUp, NDown))))
         n_side_x = n_side
         n_side_y = n_side
     else:
-        ( n_side_x , n_side_y ) = gridShape
-        
+        (n_side_x, n_side_y) = gridShape
+
     x_points = jnp.linspace(0, 1, n_side_x, endpoint=False)
     y_points = jnp.linspace(0, 1, n_side_y, endpoint=False)
-    
+
     xx, yy = jnp.meshgrid(x_points, y_points, indexing='ij')
     frac_up = jnp.stack([xx, yy], axis=-1).reshape(-1, 2)
-    
+
     dx = 1.0 / n_side_x
     dy = 1.0 / n_side_y
-    
-    shift_vec = jnp.array([dx / 2.0, dy / 2.0]) 
-    
+
+    shift_vec = jnp.array([dx / 2.0, dy / 2.0])
+
     frac_down = (frac_up + shift_vec) % 1.0
-    
+
     upPositions = frac_up @ lattice
     downPositions = frac_down @ lattice
-    
+
     coordinates = jnp.concatenate([
         upPositions[:NUp], downPositions[:NDown]
     ], axis=0)
 
     return coordinates
 
-def acceptanceArray(rs1, rs2):
+
+def acceptance_array(rs1: jnp.ndarray, rs2: jnp.ndarray) -> jnp.ndarray:
     """
-    Returns an array that shows which walkers have been updated to new
-    positions (True) and which have not (False).
-    
-    The inputs should be lists of electron positions with shape (W,N,D), where
-    W is the number of walkers, N is the number of electrons, D is the number
-    of dimensions.
+    Returns a boolean array indicating which walkers moved to new positions.
+
+    Args:
+        rs1, rs2: Walker positions with shape (W, N, D).
     """
     matchBools = rs1 == rs2
-    match = jnp.all(matchBools, axis=(1,2))
+    match = jnp.all(matchBools, axis=(1, 2))
     return ~match
 
-def acceptanceRate(rs1, rs2):
+
+def acceptance_rate(rs1: jnp.ndarray, rs2: jnp.ndarray) -> float:
     """
-    Returns the Metropolis acceptance rate given the before and after electron
-    positions.
-    
-    The inputs should be lists of electron positions with shape (W,N,D), where
-    W is the number of walkers, N is the number of electrons, D is the number
-    of dimensions.
+    Returns the Metropolis acceptance rate.
+
+    Args:
+        rs1, rs2: Walker positions with shape (W, N, D).
     """
     matchBools = rs1 == rs2
-    match = jnp.all(matchBools, axis=(1,2))
+    match = jnp.all(matchBools, axis=(1, 2))
     return 1 - jnp.average(match)
 
-def blockingAnalysis(energies, neql=0, printQ=False, writeQ=False):
+
+def blocking_analysis(energies: np.ndarray, neql: int = 0, printQ=False, writeQ=False):
     weights = np.ones(energies.shape)
     nSamples = weights.shape[0] - neql
     weights = weights[neql:]
@@ -218,12 +221,12 @@ def blockingAnalysis(energies, neql=0, printQ=False, writeQ=False):
         blockedWeights = np.zeros(nBlocks)
         blockedEnergies = np.zeros(nBlocks)
         for j in range(nBlocks):
-            blockedWeights[j] = weights[j * i : (j + 1) * i].sum()
+            blockedWeights[j] = weights[j * i: (j + 1) * i].sum()
             blockedEnergies[j] = (
-                weightedEnergies[j * i : (j + 1) * i].sum() / blockedWeights[j]
+                weightedEnergies[j * i: (j + 1) * i].sum() / blockedWeights[j]
             )
         v1 = blockedWeights.sum()
-        v2 = (blockedWeights**2).sum()
+        v2 = (blockedWeights ** 2).sum()
         mean = np.multiply(blockedWeights, blockedEnergies).sum() / v1
         error = (
             np.multiply(blockedWeights, (blockedEnergies - mean) ** 2).sum()
@@ -246,10 +249,11 @@ def blockingAnalysis(energies, neql=0, printQ=False, writeQ=False):
 
     return meanEnergy, plateauError
 
-def getStatistics(path):
-    
-    (mean,error) = (None,None)
-    
+
+def get_statistics(path: str):
+
+    (mean, error) = (None, None)
+
     if os.path.isfile(path):
         with open(path, 'r') as f:
             for line in f:
@@ -262,4 +266,4 @@ def getStatistics(path):
                     if match:
                         error = float(match.group(1))
 
-    return (mean,error)
+    return (mean, error)
